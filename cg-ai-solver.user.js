@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.1.0
+// @version      2.1.1
 // @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
@@ -330,9 +330,7 @@
                 'Rules: `public class Main` with `public static void main(String[] args)`; helper classes non-public or nested; NO package; ASCII only unless sample requires; read all stdin until EOF; only the Java standard library.'].join('\n');
             user = `【题目标题】${problem.title}\n\n【题目内容】\n${problem.statement}\n\n请给出完整 Java 解法。`;
         }
-        const msgs = [{ role: 'system', content: sys }, { role: 'user', content: user }];
-        if (prev && prev.answer) { msgs.push({ role: 'assistant', content: prev.answer }); msgs.push({ role: 'user', content: prev.feedback || '上次提交未通过，请修正后重新按要求输出。' }); }
-        return msgs;
+        return [{ role: 'system', content: sys }, { role: 'user', content: user }];
     }
     function callLLM(messages, opts, apiKey) {
         const baseURL = getBaseURL(), host = baseURL.replace(/^https?:\/\//, '');
@@ -460,50 +458,52 @@
     }
 
     /* ============================ 解一题（多版本 + 失败读样例） ============================ */
-    function ladderFor(s) {
-        const strong = s.strongModel || s.model;
-        const L = [{ model: s.model, thinking: s.thinking, temperature: 0 }];
-        if (s.maxAttempts >= 2) L.push({ model: s.model, thinking: true, temperature: 0.5 });
-        if (s.maxAttempts >= 3) L.push({ model: strong, thinking: true, temperature: 0 });
-        for (let i = L.length; i < s.maxAttempts; i++) L.push({ model: strong, thinking: true, temperature: 0.3 + 0.15 * i });
-        return L.slice(0, Math.max(1, s.maxAttempts));
+    // 每一版的模型计划：前面几版「不换模型」只累积上下文纠错；仅最后一版升级到更高模型
+    function planFor(s) {
+        const N = Math.max(1, +s.maxAttempts || 1), strong = s.strongModel || s.model;
+        const plan = [];
+        for (let i = 0; i < N; i++) {
+            const useStrong = (i === N - 1) && strong !== s.model && N >= 2; // 仅最后一版换更高模型
+            plan.push({ model: useStrong ? strong : s.model, thinking: useStrong ? true : s.thinking, temperature: i === 0 ? 0 : (useStrong ? 0 : 0.4), escalate: useStrong });
+        }
+        return plan;
     }
-    // 返回最佳结果 {ok,passed,total,score,answer,display,attempt,verdict}
+    // 多版本：同一对话累积「代码→错误样例→纠正代码→…」，同模型纠错，最后一版才升级更高模型
     async function solveProblem(kind, problem, ids, s, onAttempt) {
-        const apiKey = getKey(), ladder = ladderFor(s);
-        let best = null, prev = null;
-        let baselineTime = '';
+        const apiKey = getKey(), plan = planFor(s);
+        const messages = buildMessages(problem); // [system, user(题目)]，后续把每版回复与错误样例追加进同一对话
+        let best = null, baselineTime = '';
         try { baselineTime = submitTimeOf((parseVerdict(await fetchVerdict(ids.assignID, ids.problemID)) || {}).content); } catch (_) {}
-        for (let i = 0; i < ladder.length; i++) {
-            const opt = ladder[i];
-            onAttempt && onAttempt(i + 1, ladder.length, opt);
+        for (let i = 0; i < plan.length; i++) {
+            const opt = plan[i];
+            onAttempt && onAttempt(i + 1, plan.length, opt);
             let res;
             try {
-                const raw = await callLLM(buildMessages(problem, prev), opt, apiKey);
-                let answer, display;
+                const raw = await callLLM(messages, opt, apiKey);
+                messages.push({ role: 'assistant', content: raw }); // 模型本版回复留在上下文里
+                let display;
                 if (kind === 'gap') {
                     const answers = parseGapAnswers(raw);
                     if (!Object.keys(answers).length) throw new Error('未解析出填空 JSON');
-                    answer = JSON.stringify(answers); display = answer;
-                    fillGapAndSubmit(answers);
+                    display = JSON.stringify(answers); fillGapAndSubmit(answers);
                 } else {
                     const code = parseJavaCode(raw);
                     if (!/class\s+\w+/.test(code)) throw new Error('生成结果不是有效 Java');
                     const mainClass = (kind === 'iface' && problem.mainClass) ? problem.mainClass : detectMainClass(code);
-                    answer = '```java\n' + code + '\n```'; display = code;
-                    fillAndSubmit(code, mainClass);
+                    display = code; fillAndSubmit(code, mainClass);
                 }
                 const v = await pollVerdict(ids.assignID, ids.problemID, baselineTime);
                 baselineTime = submitTimeOf(v && v.content) || baselineTime;
                 const sc = scoreOf(v && v.content || '');
                 res = { ok: sc.total > 0 && sc.passed === sc.total, ...sc, display, verdict: v, attempt: i + 1 };
-                if (!res.ok) { // 读样例反馈给下一版
+                if (!res.ok && i < plan.length - 1) { // 读错误样例，作为新一轮 user 反馈追加到同一对话
                     const fb = feedbackFromHtml(await fetchFailDetail(ids.assignID, ids.problemID));
-                    prev = { answer, feedback: fb };
+                    messages.push({ role: 'user', content: fb || '上次提交未通过，请仔细修正后重新输出完整答案。' });
                 }
             } catch (e) {
                 res = { ok: false, error: e.message, passed: 0, total: 0, score: null, attempt: i + 1 };
-                prev = { answer: prev && prev.answer, feedback: '上次尝试出错：' + e.message + '，请重新给出完整答案。' };
+                if (i < plan.length - 1 && messages[messages.length - 1].role === 'assistant')
+                    messages.push({ role: 'user', content: '上次输出有问题（' + e.message + '），请修正后重新给出完整答案。' });
             }
             if (!best || (res.passed || 0) > (best.passed || 0)) best = res;
             if (res.ok) { best = res; break; }
@@ -548,13 +548,13 @@
 
             if (!s.autoSubmit && kind !== 'gap') {
                 tickStatus(`正在调用 ${s.model} 生成代码…`);
-                const code = parseJavaCode(await callLLM(buildMessages(problem, null), { model: s.model, thinking: s.thinking, temperature: 0 }, apiKey));
+                const code = parseJavaCode(await callLLM(buildMessages(problem), { model: s.model, thinking: s.thinking, temperature: 0 }, apiKey));
                 const mc = (kind === 'iface' && problem.mainClass) ? problem.mainClass : detectMainClass(code); fillOnly(code, mc);
                 codeWrap.querySelector('.cgai-code').textContent = code;
                 codeWrap.querySelector('summary').textContent = `生成代码 · 主类 ${mc}`; codeWrap.style.display = 'block';
                 setStatus(`代码已生成并填入（主类 ${mc}）。已关闭自动提交——请检查后手动点"提 交"。`, 'ok'); return;
             }
-            const r = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`第 ${i}/${n} 版：${opt.model}${opt.thinking ? '·思考' : ''} 生成并提交中…`));
+            const r = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`第 ${i}/${n} 版${opt.escalate ? '·升级强模型' : (i > 1 ? '·按错误样例纠错' : '')}（${opt.model}${opt.thinking ? '·思考' : ''}）生成提交中…`));
             if (r.display) { codeWrap.querySelector('.cgai-code').textContent = r.display; codeWrap.querySelector('summary').textContent = `生成答案 · 第 ${r.attempt} 版`; codeWrap.style.display = 'block'; }
             setStatus(verdictBadge(r), r.ok ? 'ok' : ((r.passed || 0) > 0 ? 'busy' : 'err'));
             showVerdictCard(r.verdict && r.verdict.content);
@@ -623,7 +623,7 @@
                 let r;
                 if (s.skipPassed) { const pv = parseVerdict(await fetchVerdict(ids.assignID, ids.problemID)); const sc = scoreOf(pv && pv.content || ''); if (sc.total > 0 && sc.passed === sc.total) r = { skipped: true, ...sc, title: problem.title }; }
                 if (!r) {
-                    const res = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`开刷 ${k}：第 ${i}/${n} 版（${opt.model}${opt.thinking ? '·思考' : ''}）…`));
+                    const res = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`开刷 ${k}·第 ${i}/${n} 版${opt.escalate ? '·升级' : (i > 1 ? '·纠错' : '')}（${opt.model}${opt.thinking ? '·思考' : ''}）…`));
                     r = { ok: res.ok, passed: res.passed, total: res.total, score: res.score, error: res.error, attempt: res.attempt, title: problem.title };
                     if (res.verdict) showVerdictCard(res.verdict.content);
                 }
@@ -748,7 +748,7 @@
     GM_registerMenuCommand('停止开刷 / 清除进度', () => { clearGrind(); if (grindEl) renderGrind(); if (statusEl) setStatus('已清除开刷进度。', ''); if (btnGrind) refreshButtons(); });
 
     if (typeof window !== 'undefined' && window.__CGAI_EXPOSE__) {
-        window.__CGAI_API__ = { htmlToText, titleOf, extractStatement, extractGap, extractFor, extractIds, getCur, pageType, discoverAssignList, discoverCourseID, fetchAssignProblems, buildQueue, parseJavaCode, detectMainClass, parseGapAnswers, parseVerdict, submitTimeOf, scoreOf, feedbackFromHtml, buildMessages, ladderFor };
+        window.__CGAI_API__ = { htmlToText, titleOf, extractStatement, extractGap, extractFor, extractIds, getCur, pageType, discoverAssignList, discoverCourseID, fetchAssignProblems, buildQueue, parseJavaCode, detectMainClass, parseGapAnswers, parseVerdict, submitTimeOf, scoreOf, feedbackFromHtml, buildMessages, planFor };
     }
 
     function boot() {
