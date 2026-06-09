@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.0.0
-// @description  希冀(CourseGrading/educg) 编程题：提取题目→DeepSeek 生成 Java→自动提交→读判题结果；支持一键串行开刷所有作业/所有题目、失败多版本重试、自动跳题。
+// @version      2.1.0
+// @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
 // @supportURL   https://github.com/winbeau/xiji/issues
@@ -25,8 +25,9 @@
 
 (function () {
     'use strict';
-    // 只在顶层框架运行：避免注入到判题结果 iframe(showProcessMsg/longtimerun)
-    if (window.top !== window.self) return;
+    if (window.top !== window.self) return; // 不注入到判题结果 iframe
+
+    const pageT0 = Date.now();
 
     /* ============================ 配置 / 存储 ============================ */
     const STORE = {
@@ -34,14 +35,13 @@
         THINKING: 'ds_thinking', AUTO_SUBMIT: 'cg_auto_submit', MAX_ATTEMPTS: 'cg_max_attempts',
         SKIP_PASSED: 'cg_skip_passed', GRIND: 'cg_grind_state',
     };
-    // 默认走 DeepSeek，但 Base URL / 模型可在配置页改成任意 OpenAI 兼容服务
     const DEFAULTS = { baseURL: 'https://api.deepseek.com', model: 'deepseek-v4-flash', strongModel: 'deepseek-v4-pro' };
     const MODEL_SUGGEST = ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner', 'gpt-4o-mini', 'gpt-4o', 'qwen-max'];
     const OJ = location.origin;
+    const PAGE_OF = { file: 'programList.jsp', iface: 'programWithInterfaceList.jsp', gap: 'programFillGapList.jsp' };
 
     const getKey = () => (GM_getValue(STORE.KEY, '') || '').trim();
     const getBaseURL = () => (GM_getValue(STORE.BASE_URL, DEFAULTS.baseURL) || DEFAULTS.baseURL).trim().replace(/\/+$/, '');
-    const isDeepSeek = () => /deepseek/i.test(getBaseURL());
     const settings = () => ({
         baseURL: getBaseURL(),
         model: (GM_getValue(STORE.MODEL, DEFAULTS.model) || DEFAULTS.model).trim(),
@@ -54,9 +54,20 @@
     const getGrind = () => { try { return JSON.parse(GM_getValue(STORE.GRIND, '') || 'null'); } catch (_) { return null; } };
     const setGrind = g => GM_setValue(STORE.GRIND, JSON.stringify(g));
     const clearGrind = () => GM_deleteValue(STORE.GRIND);
-
-    const isProblemPage = () => /\/assignment\/programList\.jsp/i.test(location.pathname + location.search) || /programList\.jsp/i.test(location.href);
     const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    function pageType() {
+        const h = location.pathname + location.search;
+        if (/programFillGapList\.jsp/i.test(h)) return 'gap';
+        if (/programWithInterfaceList\.jsp/i.test(h)) return 'iface';
+        if (/programList\.jsp/i.test(h)) return 'file';
+        return null;
+    }
+    const isProblemPage = () => !!pageType();
+    const getCur = () => ({
+        assignID: (location.search.match(/assignID=(\d+)/) || [])[1] || '',
+        proNum: (location.search.match(/proNum=(\d+)/) || [])[1] || '',
+    });
 
     /* ============================ 图标（lucide 线性 SVG） ============================ */
     const svg = (p, s) => `<svg class="cgai-svg" width="${s || 16}" height="${s || 16}" viewBox="0 0 24 24" ` +
@@ -114,17 +125,14 @@
             color:var(--cg-muted);border-radius:var(--cg-r-sm);transition:.15s}
         #cgai-head .cgai-ic:hover{background:var(--cg-bg-hover);color:var(--cg-text)}
         #cgai-body{padding:14px 15px;overflow:auto}
-        /* 设置区 */
         .cgai-settings{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:10px 12px;margin-bottom:12px;
             background:var(--cg-bg-subtle);border:1px solid var(--cg-border);border-radius:var(--cg-r-md)}
         .cgai-settings .f{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--cg-muted)}
-        .cgai-settings select,.cgai-settings input[type=number]{padding:4px 8px;border:1px solid var(--cg-line);
-            border-radius:var(--cg-r-sm);font-size:12.5px;font-family:var(--cg-font);background:var(--cg-bg);color:var(--cg-text);outline:none}
-        .cgai-settings input[type=number]{width:48px}
-        .cgai-settings select:focus,.cgai-settings input:focus{border-color:var(--cg-link);box-shadow:0 0 0 3px rgba(35,131,226,.14)}
+        .cgai-settings input[type=number]{padding:4px 8px;border:1px solid var(--cg-line);border-radius:var(--cg-r-sm);
+            font-size:12.5px;font-family:var(--cg-font);background:var(--cg-bg);color:var(--cg-text);outline:none;width:48px}
+        .cgai-settings input:focus{border-color:var(--cg-link);box-shadow:0 0 0 3px rgba(35,131,226,.14)}
         .cgai-chk{display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--cg-text);font-size:12.5px}
         .cgai-chk input{accent-color:var(--cg-accent);width:14px;height:14px}
-        /* 按钮 */
         .cgai-btns{display:flex;gap:9px}
         .cgai-btn{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 12px;
             border-radius:var(--cg-r-md);font-size:13.5px;font-weight:600;font-family:var(--cg-font);cursor:pointer;
@@ -146,14 +154,13 @@
         #cgai-status.ok{background:var(--cg-ok-bg);border-color:var(--cg-ok-bd);color:var(--cg-ok-fg)}
         #cgai-status.err{background:var(--cg-err-bg);border-color:var(--cg-err-bd);color:var(--cg-err-fg)}
         #cgai-status.busy{background:var(--cg-busy-bg);border-color:var(--cg-busy-bd);color:var(--cg-busy-fg)}
-        /* 开刷进度列表 */
         #cgai-grind:empty{display:none}
         #cgai-grind{margin-top:12px}
         .cgai-ghead{display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--cg-muted);font-weight:600;margin-bottom:6px}
         .cgai-glist{display:flex;flex-direction:column;gap:3px;max-height:240px;overflow:auto;padding-right:2px}
         .cgai-grow{display:flex;align-items:center;gap:8px;padding:5px 9px;border:1px solid var(--cg-border);
             border-radius:var(--cg-r-sm);background:var(--cg-bg-subtle);font-size:12px}
-        .cgai-grow .gk{color:var(--cg-muted);font-variant-numeric:tabular-nums;min-width:64px}
+        .cgai-grow .gk{color:var(--cg-muted);font-variant-numeric:tabular-nums;min-width:58px}
         .cgai-grow .gt{flex:1;color:var(--cg-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .cgai-grow .gs{font-weight:600;font-variant-numeric:tabular-nums}
         .cgai-grow.ok{background:var(--cg-ok-bg);border-color:var(--cg-ok-bd)} .cgai-grow.ok .gs{color:var(--cg-ok-fg)}
@@ -184,13 +191,11 @@
         .cgai-spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-top-color:transparent;
             border-radius:50%;animation:cgaispin .7s linear infinite;vertical-align:-1px;margin-right:7px;opacity:.7}
         @keyframes cgaispin{to{transform:rotate(360deg)}}
-        /* 当前模型快捷按钮 */
         .cgai-model{display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border:1px solid var(--cg-line);
             border-radius:999px;background:var(--cg-bg);color:var(--cg-text);font-size:12px;font-weight:600;cursor:pointer;
-            font-family:var(--cg-font);max-width:160px}
+            font-family:var(--cg-font);max-width:180px}
         .cgai-model:hover{background:var(--cg-bg-hover)}
         .cgai-model span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-        /* 配置浮层（覆盖整个面板） */
         #cgai-config{position:absolute;inset:0;z-index:6;background:var(--cg-bg);display:none;flex-direction:column;padding:15px}
         #cgai-config.open{display:flex}
         #cgai-config .cfg-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
@@ -205,121 +210,141 @@
         .cgai-field .hint{font-size:11px;color:var(--cg-faint);line-height:1.4}
     `);
 
-    /* ============================ 解析 / 提取 ============================ */
+    /* ============================ 文本工具 ============================ */
     function htmlToText(html) {
         return String(html || '')
             .replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|div|li|h\d|tr)>/gi, '\n').replace(/<\/pre>/gi, '\n')
             .replace(/<li[^>]*>/gi, ' - ').replace(/<[^>]+>/g, '')
             .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"')
             .replace(/&#39;|&apos;/gi, "'").replace(/&amp;/gi, '&').replace(/ /g, ' ')
-            .replace(/ /g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+            .replace(/ /g, ' ').replace(/\n{3,}/g, '\n\n').trim();
     }
-    function extractProblem() {
+    function titleOf() {
+        const a = document.querySelector('.breadcrumb .breadcrumb-item.active');
+        if (a) return a.textContent.replace(/\s+/g, ' ').trim();
+        return (document.title || '').replace(/CourseGrading|详细评判信息[:：]?/g, '').trim() || '(题目)';
+    }
+    // 普通编程题/接口题：面包屑与首个 <hr> 之间的题面
+    function extractStatement() {
         const col = document.querySelector('#cgcontainerID .col-10') || document.querySelector('.col-10') || document.body;
-        const active = col.querySelector('.breadcrumb .breadcrumb-item.active');
-        const title = active ? active.textContent.replace(/\s+/g, ' ').trim() : '(未取得标题)';
         const nav = col.querySelector('nav[aria-label="breadcrumb"]');
         let html = '';
         if (nav) { let n = nav.nextSibling; while (n) { if (n.nodeType === 1 && n.tagName === 'HR') break; if (n.nodeType === 1) html += n.outerHTML; else if (n.nodeType === 3) html += n.nodeValue; n = n.nextSibling; } }
-        return { title, statement: htmlToText(html) };
+        return htmlToText(html);
     }
-    function extractIds() {
-        let problemID = '', assignID = '';
-        const fr = document.getElementById('showmessageFrame');
-        const src = fr ? (fr.getAttribute('src') || '') : '';
-        let m = src.match(/problemID=(\d+)/); if (m) problemID = m[1];
-        m = src.match(/assignID=(\d+)/); if (m) assignID = m[1];
-        if (!assignID) { m = location.search.match(/assignID=(\d+)/); if (m) assignID = m[1]; }
-        if (!problemID) { m = document.body.innerHTML.match(/problemID=(\d+)/); if (m) problemID = m[1]; }
-        return { problemID, assignID };
-    }
-    // 当前页 URL 里的 assignID / proNum
-    function getCur() {
-        const a = (location.search.match(/assignID=(\d+)/) || [])[1] || '';
-        const p = (location.search.match(/proNum=(\d+)/) || [])[1] || '';
-        return { assignID: a, proNum: p };
-    }
-    // 本作业题目数（从页面 proNum 导航链接里取最大值）
-    function discoverProNums() {
-        const cur = getCur();
-        let max = 0;
-        document.querySelectorAll('a[href*="programList.jsp"]').forEach(a => {
-            const h = a.getAttribute('href') || '';
-            const ma = h.match(/assignID=(\d+)/), mp = h.match(/proNum=(\d+)/);
-            if (mp && (!ma || ma[1] === cur.assignID)) max = Math.max(max, +mp[1]);
+    function readPrefilledMain() { const el = document.getElementById('javamanclass'); return el && el.value.trim() ? el.value.trim() : ''; }
+    // 填空题：把带 <textarea name=answerN> 的代码还原成带 /*__GAPk__*/ 标记的模板
+    function extractGap() {
+        const form = document.getElementById('uploadFORM') || document.querySelector('form[name="uploadFORM"]');
+        if (!form) return { template: '', gaps: 0 };
+        const nodes = form.querySelectorAll('code.cgcode, textarea[name^="answer"]');
+        const parts = []; let gaps = 0;
+        nodes.forEach(n => {
+            if (n.tagName === 'TEXTAREA') { const k = +((n.getAttribute('name') || '').match(/answer(\d+)/) || [])[1] || 0; gaps = Math.max(gaps, k); parts.push(`/*__GAP${k}__*/`); }
+            else parts.push(n.textContent);
         });
-        return Math.max(max, +cur.proNum || 1);
+        let template = parts.join('');
+        if (!template) { // 兜底：整表去掉控件后的文本
+            const c = form.cloneNode(true);
+            c.querySelectorAll('textarea[name^="answer"]').forEach(t => { const k = +((t.getAttribute('name') || '').match(/answer(\d+)/) || [])[1] || 0; gaps = Math.max(gaps, k); t.replaceWith(document.createTextNode(`/*__GAP${k}__*/`)); });
+            c.querySelectorAll('input,button,select,script,style,iframe').forEach(e => e.remove());
+            template = c.textContent.replace(/\n{3,}/g, '\n\n').trim();
+        }
+        template = template.replace(/\u00a0/g, ' ').replace(/\u3000/g, '  '); // normalize nbsp / fullwidth
+        return { template, gaps };
     }
-    // 作业列表（从页面作业切换链接 index.jsp?assignID= 取，按 DOM 顺序去重）
+    // 统一提取：根据题型返回 problem 对象
+    function extractFor(kind) {
+        const title = titleOf();
+        if (kind === 'gap') { const g = extractGap(); return { kind, title, statement: extractStatement(), template: g.template, gaps: g.gaps }; }
+        const p = { kind, title, statement: extractStatement() };
+        if (kind === 'iface') p.mainClass = readPrefilledMain() || '';
+        return p;
+    }
+
+    /* ============================ 列表 / 队列发现 ============================ */
     function discoverAssignList() {
         const seen = new Set(), list = [];
-        document.querySelectorAll('a[href*="index.jsp"]').forEach(a => {
-            const m = (a.getAttribute('href') || '').match(/assignID=(\d+)/);
-            if (m && !seen.has(m[1])) { seen.add(m[1]); list.push(m[1]); }
-        });
+        document.querySelectorAll('a[href*="index.jsp"]').forEach(a => { const m = (a.getAttribute('href') || '').match(/assignID=(\d+)/); if (m && !seen.has(m[1])) { seen.add(m[1]); list.push(m[1]); } });
         return list;
     }
-    // 从 mainActiveAssigns.jsp 拉作业列表（在非题目页 kickoff 时用）
-    function fetchAssignList() {
+    function discoverCourseID() { const m = (document.body.innerHTML || '').match(/courseID=(\d+)/); return m ? m[1] : ''; }
+    function gmGetText(url) {
         return new Promise(resolve => {
             GM_xmlhttpRequest({
-                method: 'GET', url: `${OJ}/assignment/mainActiveAssigns.jsp`, responseType: 'arraybuffer', timeout: 15000,
-                onload: r => {
-                    let txt = ''; try { txt = new TextDecoder('gbk').decode(new Uint8Array(r.response)); } catch (_) {}
-                    const seen = new Set(), list = [], re = /assignID=(\d+)/g; let m;
-                    while ((m = re.exec(txt))) if (!seen.has(m[1])) { seen.add(m[1]); list.push(m[1]); }
-                    resolve(list);
-                },
-                onerror: () => resolve([]), ontimeout: () => resolve([]),
+                method: 'GET', url, responseType: 'arraybuffer', timeout: 15000,
+                onload: r => { try { resolve(new TextDecoder('gbk').decode(new Uint8Array(r.response))); } catch (_) { resolve(''); } },
+                onerror: () => resolve(''), ontimeout: () => resolve(''),
             });
         });
     }
-    function parseJavaCode(content) { const m = String(content || '').match(/```(?:java)?\s*([\s\S]*?)```/i); return (m ? m[1] : content || '').trim(); }
-    function detectMainClass(code) { let m = code.match(/public\s+class\s+([A-Za-z_]\w*)/) || code.match(/\bclass\s+([A-Za-z_]\w*)/); return m ? m[1] : 'Main'; }
-    function scoreOf(contentHtml) {
-        const txt = htmlToText(contentHtml || '');
-        const passed = (txt.match(/完全正确/g) || []).length;
-        const tm = txt.match(/共有测试数据[:：]\s*(\d+)/); const total = tm ? +tm[1] : 0;
-        const sm = txt.match(/得分\s*([\d.]+)/); const score = sm ? sm[1] : null;
-        return { passed, total, score };
+    async function fetchAssignList() {
+        const txt = await gmGetText(`${OJ}/assignment/mainActiveAssigns.jsp`);
+        const seen = new Set(), list = [], re = /assignID=(\d+)/g; let m;
+        while ((m = re.exec(txt))) if (!seen.has(m[1])) { seen.add(m[1]); list.push(m[1]); }
+        return list;
+    }
+    // 读某作业 index.jsp，提取「实际存在」的题目链接（含正确页型），按 proNum 升序
+    async function fetchAssignProblems(assignID, courseID) {
+        const url = `${OJ}/assignment/index.jsp?${courseID ? 'courseID=' + courseID + '&' : ''}assignID=${assignID}`;
+        const html = await gmGetText(url);
+        const seen = new Set(), items = [];
+        const re = /(programList|programFillGapList|programWithInterfaceList)\.jsp\?([^"'\s>]+)/g; let m;
+        while ((m = re.exec(html))) {
+            const page = m[1] + '.jsp', q = m[2];
+            const pn = (q.match(/proNum=(\d+)/) || [])[1], aid = (q.match(/assignID=(\d+)/) || [])[1];
+            if (pn && aid === String(assignID) && !seen.has(pn)) { seen.add(pn); items.push({ assignID: String(assignID), proNum: +pn, page }); }
+        }
+        items.sort((a, b) => a.proNum - b.proNum);
+        return items;
+    }
+    async function buildQueue() {
+        let assignList = isProblemPage() ? discoverAssignList() : [];
+        if (!assignList.length) assignList = await fetchAssignList();
+        assignList = [...new Set(assignList.map(String))].sort((a, b) => +a - +b); // 从最小作业开始
+        const courseID = discoverCourseID();
+        const queue = [];
+        for (const a of assignList) queue.push(...await fetchAssignProblems(a, courseID));
+        queue.sort((x, y) => (+x.assignID - +y.assignID) || (x.proNum - y.proNum));
+        return queue;
     }
 
     /* ============================ DeepSeek ============================ */
-    function buildMessages(problem) {
-        const sys = [
-            'You are an expert solver for a Chinese university Java online judge (CourseGrading/educg).',
-            'You will be given a programming problem in Chinese. Produce ONE complete, compilable Java program',
-            'that reads from standard input and writes to standard output, matching the required output format',
-            'EXACTLY as shown in the sample (including every space, blank line, and trailing whitespace).',
-            '', 'Strict rules:',
-            '1. Output ONLY a single fenced ```java code block. No prose before or after.',
-            '2. The program MUST contain `public class Main` with `public static void main(String[] args)`.',
-            '   Any helper classes must be top-level NON-public (no `public`) or nested inside Main.',
-            '3. Do NOT use any `package` declaration.',
-            '4. ASCII only: no Chinese characters or non-ASCII anywhere in the code unless the sample output requires them.',
-            '5. Read all of stdin until EOF. Reproduce the sample output byte-for-byte.',
-            '6. Only the Java standard library. Handle edge cases (empty input, extra whitespace).',
-        ].join('\n');
-        const user = `【题目标题】${problem.title}\n\n【题目内容】\n${problem.statement}\n\n请给出完整 Java 解法。`;
-        return [{ role: 'system', content: sys }, { role: 'user', content: user }];
+    function buildMessages(problem, prev) {
+        const common = 'You are an expert solver for a Chinese university Java online judge (CourseGrading/educg). The judge compares program stdout against hidden test cases and must match byte-for-byte.';
+        let sys, user;
+        if (problem.kind === 'gap') {
+            sys = [common, '', 'This is a FILL-IN-THE-BLANK Java problem. You are given Java source with blanks marked /*__GAPk__*/.',
+                'Output ONLY a single JSON object mapping each blank number (string key) to the exact code text that fills that blank — nothing else, no code fence, no prose.',
+                'Each value is just the snippet for that blank (do NOT repeat surrounding code). Keep it ASCII. Example: {"1":"abstract class","2":"return this.x;"}'].join('\n');
+            user = `${problem.statement ? '【题目说明】\n' + problem.statement + '\n\n' : ''}【带空位的代码】\n${problem.template}\n\n请按上面要求输出 JSON。`;
+        } else if (problem.kind === 'iface') {
+            sys = [common, '', 'This is an INTERFACE-IMPLEMENTATION problem. Produce ONE complete, compilable Java source file that includes everything needed (the required interface(s), your implementation, and the main/test class).',
+                'Output ONLY one fenced ```java code block, no prose.',
+                problem.mainClass ? `The entry/main class MUST be \`${problem.mainClass}\`. If it contains a dot, the part before the last dot is the package — add the matching \`package\` declaration; the public class is the part after the last dot.` : 'Use a sensible public main class.',
+                'ASCII only unless the sample output needs otherwise. Read stdin to EOF if the program reads input; reproduce required output exactly.'].join('\n');
+            user = `【题目标题】${problem.title}\n\n【题目内容】\n${problem.statement}\n\n请给出完整、可直接提交的 Java 源文件。`;
+        } else {
+            sys = [common, '', 'Produce ONE complete, compilable Java program reading stdin and writing stdout, matching the sample output EXACTLY (every space/blank line/trailing whitespace).',
+                'Output ONLY one fenced ```java code block, no prose.',
+                'Rules: `public class Main` with `public static void main(String[] args)`; helper classes non-public or nested; NO package; ASCII only unless sample requires; read all stdin until EOF; only the Java standard library.'].join('\n');
+            user = `【题目标题】${problem.title}\n\n【题目内容】\n${problem.statement}\n\n请给出完整 Java 解法。`;
+        }
+        const msgs = [{ role: 'system', content: sys }, { role: 'user', content: user }];
+        if (prev && prev.answer) { msgs.push({ role: 'assistant', content: prev.answer }); msgs.push({ role: 'user', content: prev.feedback || '上次提交未通过，请修正后重新按要求输出。' }); }
+        return msgs;
     }
-    function callDeepSeek(problem, opts, apiKey) {
-        const baseURL = getBaseURL();
-        const payload = {
-            model: opts.model, messages: buildMessages(problem), stream: false,
-            temperature: opts.temperature ?? 0, max_tokens: 8192,
-        };
-        // thinking 是 DeepSeek 专有参数；其他 OpenAI 兼容端点不发，避免 400
+    function callLLM(messages, opts, apiKey) {
+        const baseURL = getBaseURL(), host = baseURL.replace(/^https?:\/\//, '');
+        const payload = { model: opts.model, messages, stream: false, temperature: opts.temperature ?? 0, max_tokens: 8192 };
         if (/deepseek/i.test(baseURL)) payload.thinking = { type: opts.thinking ? 'enabled' : 'disabled' };
-        const body = JSON.stringify(payload);
-        const host = baseURL.replace(/^https?:\/\//, '');
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
-                method: 'POST', url: baseURL + '/chat/completions', data: body, responseType: 'text', timeout: 120000,
+                method: 'POST', url: baseURL + '/chat/completions', data: JSON.stringify(payload), responseType: 'text', timeout: 120000,
                 headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
                 onload: r => {
                     if (r.status === 401) return reject(new Error('API Key 无效 (401)，请到配置页检查'));
-                    if (r.status === 0) return reject(new Error(`连不上 ${host}（浏览器是否能访问该 API？脚本猫是否已允许跨域连接？）`));
+                    if (r.status === 0) return reject(new Error(`连不上 ${host}（浏览器能否访问该 API？脚本猫是否已允许跨域连接？）`));
                     if (r.status !== 200) return reject(new Error(`API ${r.status}: ` + (r.responseText || '').slice(0, 160)));
                     let d; try { d = JSON.parse(r.responseText); } catch (e) { return reject(new Error('无法解析响应')); }
                     const c = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
@@ -331,25 +356,39 @@
             });
         });
     }
+    function parseJavaCode(content) { const m = String(content || '').match(/```(?:java)?\s*([\s\S]*?)```/i); return (m ? m[1] : content || '').trim(); }
+    function detectMainClass(code) { let m = code.match(/public\s+class\s+([A-Za-z_]\w*)/) || code.match(/\bclass\s+([A-Za-z_]\w*)/); return m ? m[1] : 'Main'; }
+    function parseGapAnswers(raw) {
+        let t = String(raw || '').trim();
+        const m = t.match(/```(?:json)?\s*([\s\S]*?)```/i); if (m) t = m[1].trim();
+        const s = t.indexOf('{'), e = t.lastIndexOf('}'); if (s >= 0 && e >= 0) t = t.slice(s, e + 1);
+        let o; try { o = JSON.parse(t); } catch (_) { o = null; }
+        const out = {}; if (o) Object.keys(o).forEach(k => { const n = (k.match(/\d+/) || [])[0]; if (n != null) out[n] = String(o[k]); });
+        return out;
+    }
 
     /* ============================ 提交 / 判题 ============================ */
     function fillAndSubmit(code, mainClass) {
-        const fileInput = document.getElementById('CGFILE');
-        const mainEl = document.getElementById('javamanclass');
-        const btn = document.getElementById('cgSubmitBtn');
-        const form = document.querySelector('form[name="upload"]');
-        if (!fileInput || !btn || !form) throw new Error('未找到页面提交表单');
-        if (mainEl) mainEl.value = mainClass;
-        const dt = new DataTransfer();
-        dt.items.add(new File([code], mainClass + '.java', { type: 'text/x-java' }));
-        fileInput.files = dt.files;
-        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+        const fileInput = document.getElementById('CGFILE'), mainEl = document.getElementById('javamanclass');
+        const btn = document.getElementById('cgSubmitBtn'), form = document.querySelector('form[name="upload"]');
+        if (!fileInput || !btn || !form) throw new Error('未找到文件提交表单');
+        if (mainEl && mainClass) mainEl.value = mainClass;
+        const simple = (mainClass || 'Main').split('.').pop();
+        const dt = new DataTransfer(); dt.items.add(new File([code], simple + '.java', { type: 'text/x-java' }));
+        fileInput.files = dt.files; fileInput.dispatchEvent(new Event('change', { bubbles: true }));
         if (typeof form.requestSubmit === 'function') form.requestSubmit(btn); else btn.click();
     }
     function fillOnly(code, mainClass) {
         const fileInput = document.getElementById('CGFILE'), mainEl = document.getElementById('javamanclass');
-        if (mainEl) mainEl.value = mainClass;
-        if (fileInput) { const dt = new DataTransfer(); dt.items.add(new File([code], mainClass + '.java', { type: 'text/x-java' })); fileInput.files = dt.files; fileInput.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (mainEl && mainClass) mainEl.value = mainClass;
+        if (fileInput) { const simple = (mainClass || 'Main').split('.').pop(); const dt = new DataTransfer(); dt.items.add(new File([code], simple + '.java', { type: 'text/x-java' })); fileInput.files = dt.files; fileInput.dispatchEvent(new Event('change', { bubbles: true })); }
+    }
+    function fillGapAndSubmit(answers) {
+        const form = document.getElementById('uploadFORM') || document.querySelector('form[name="uploadFORM"]');
+        if (!form) throw new Error('未找到填空表单 uploadFORM');
+        Object.keys(answers).forEach(k => { const ta = form.querySelector(`textarea[name="answer${k}"]`); if (ta) ta.value = answers[k]; });
+        const w = form.querySelector('[name="wtime"]'); if (w) w.value = Math.max(1, Math.round((Date.now() - pageT0) / 1000));
+        form.submit();
     }
     function fetchVerdict(assignID, problemID) {
         return new Promise((resolve, reject) => {
@@ -367,23 +406,60 @@
         let arr; try { arr = JSON.parse(text.slice(s, e + 1)); } catch (_) { return null; }
         return { ret: (arr.find(o => 'ret' in o) || {}).ret, content: (arr.find(o => 'content' in o) || {}).content || '' };
     }
-    async function pollVerdict(assignID, problemID, baseline) {
-        const deadline = Date.now() + 100000;
-        await sleep(1500);
+    const submitTimeOf = c => { const m = (c || '').match(/最后一次提交时间[:：]\s*([0-9][0-9\-\s:]+)/); return m ? m[1].trim() : ''; };
+    // 用「最后一次提交时间」作为新鲜度判据——避免重复提交内容相同时永远等不到（旧版卡死根因）
+    async function pollVerdict(assignID, problemID, baselineTime) {
+        const deadline = Date.now() + 90000;
+        await sleep(2500);
         let last = null;
         while (Date.now() < deadline) {
             let text = ''; try { text = await fetchVerdict(assignID, problemID); } catch (_) {}
             const v = parseVerdict(text);
             if (v && v.content && !/正在评判|排队|评判中|judging/i.test(v.content)) {
-                // 若有 baseline（提交前的内容），要求与之不同，确认是新结果
-                if (!baseline || v.content !== baseline) { last = v; if (v.ret === '1') return v; }
+                last = v;
+                if (v.ret === '1' && (!baselineTime || submitTimeOf(v.content) !== baselineTime)) return v;
             }
             await sleep(2000);
         }
         return last;
     }
+    function scoreOf(c) {
+        const txt = htmlToText(c || '');
+        const passed = (txt.match(/完全正确/g) || []).length;
+        const total = +((txt.match(/共有测试数据[:：]\s*(\d+)/) || [])[1]) || 0;
+        const score = (txt.match(/得分\s*([\d.]+)/) || [])[1] || null;
+        return { passed, total, score };
+    }
+    // 失败时读「动态测试」详情：期望输出 vs 你的输出，反馈给模型
+    function fetchFailDetail(assignID, problemID) {
+        return new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: 'POST', url: `${OJ}/assignment/moretest/dynamictest.jsp`, data: `assignID=${assignID}&problemID=${problemID}&userID=`,
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, responseType: 'arraybuffer', timeout: 20000,
+                onload: r => { let html = ''; try { html = new TextDecoder('gbk').decode(new Uint8Array(r.response)); } catch (_) {} resolve(html); },
+                onerror: () => resolve(''), ontimeout: () => resolve(''),
+            });
+        });
+    }
+    function feedbackFromHtml(html) {
+        if (!html) return '';
+        let doc; try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch (_) { return ''; }
+        const txt = (doc.body && doc.body.textContent) || '';
+        if (/编译错误|编译失败|compile error/i.test(txt) && !/成功通过编译/.test(txt)) {
+            const seg = (txt.match(/编译[\s\S]{0,500}/) || [''])[0];
+            return '上次提交【编译错误】：\n' + seg.trim().slice(0, 700) + '\n请修正使其能编译。';
+        }
+        const wrongs = doc.querySelectorAll('pre[id^="wrongContent"]');
+        for (const w of wrongs) {
+            const n = (w.id.match(/wrongContent(\d+)/) || [])[1];
+            const r = doc.getElementById('rightContent' + n);
+            const right = (r ? r.textContent : '').slice(0, 1200), wrong = (w.textContent || '').slice(0, 1200);
+            if (right || wrong) return `上次提交在【测试数据${n}】输出错误。\n【期望输出】\n${right}\n【你的输出】\n${wrong}\n请仔细对比差异（注意空格/换行/大小写/精度），修正后重新按要求输出。`;
+        }
+        return '上次提交未通过，但未取到具体差异。请重新审视题意与输出格式后再试。';
+    }
 
-    /* ============================ 解一题（含多版本重试） ============================ */
+    /* ============================ 解一题（多版本 + 失败读样例） ============================ */
     function ladderFor(s) {
         const strong = s.strongModel || s.model;
         const L = [{ model: s.model, thinking: s.thinking, temperature: 0 }];
@@ -392,44 +468,57 @@
         for (let i = L.length; i < s.maxAttempts; i++) L.push({ model: strong, thinking: true, temperature: 0.3 + 0.15 * i });
         return L.slice(0, Math.max(1, s.maxAttempts));
     }
-    // 解当前页这道题，返回最佳结果 {ok,score,passed,total,code,mainClass,attempt,verdict}
-    async function solveCurrent(problem, ids, s, onAttempt) {
-        const apiKey = getKey();
-        const ladder = ladderFor(s);
-        let best = null, baseline = null;
-        try { baseline = (parseVerdict(await fetchVerdict(ids.assignID, ids.problemID)) || {}).content || null; } catch (_) {}
+    // 返回最佳结果 {ok,passed,total,score,answer,display,attempt,verdict}
+    async function solveProblem(kind, problem, ids, s, onAttempt) {
+        const apiKey = getKey(), ladder = ladderFor(s);
+        let best = null, prev = null;
+        let baselineTime = '';
+        try { baselineTime = submitTimeOf((parseVerdict(await fetchVerdict(ids.assignID, ids.problemID)) || {}).content); } catch (_) {}
         for (let i = 0; i < ladder.length; i++) {
             const opt = ladder[i];
             onAttempt && onAttempt(i + 1, ladder.length, opt);
             let res;
             try {
-                const code = parseJavaCode(await callDeepSeek(problem, opt, apiKey));
-                const mainClass = detectMainClass(code);
-                if (!/class\s+\w+/.test(code)) throw new Error('生成结果不是有效 Java');
-                fillAndSubmit(code, mainClass);
-                const v = await pollVerdict(ids.assignID, ids.problemID, baseline);
+                const raw = await callLLM(buildMessages(problem, prev), opt, apiKey);
+                let answer, display;
+                if (kind === 'gap') {
+                    const answers = parseGapAnswers(raw);
+                    if (!Object.keys(answers).length) throw new Error('未解析出填空 JSON');
+                    answer = JSON.stringify(answers); display = answer;
+                    fillGapAndSubmit(answers);
+                } else {
+                    const code = parseJavaCode(raw);
+                    if (!/class\s+\w+/.test(code)) throw new Error('生成结果不是有效 Java');
+                    const mainClass = (kind === 'iface' && problem.mainClass) ? problem.mainClass : detectMainClass(code);
+                    answer = '```java\n' + code + '\n```'; display = code;
+                    fillAndSubmit(code, mainClass);
+                }
+                const v = await pollVerdict(ids.assignID, ids.problemID, baselineTime);
+                baselineTime = submitTimeOf(v && v.content) || baselineTime;
                 const sc = scoreOf(v && v.content || '');
-                baseline = (v && v.content) || baseline;
-                res = { ok: sc.total > 0 && sc.passed === sc.total, ...sc, code, mainClass, verdict: v, attempt: i + 1 };
+                res = { ok: sc.total > 0 && sc.passed === sc.total, ...sc, display, verdict: v, attempt: i + 1 };
+                if (!res.ok) { // 读样例反馈给下一版
+                    const fb = feedbackFromHtml(await fetchFailDetail(ids.assignID, ids.problemID));
+                    prev = { answer, feedback: fb };
+                }
             } catch (e) {
                 res = { ok: false, error: e.message, passed: 0, total: 0, score: null, attempt: i + 1 };
+                prev = { answer: prev && prev.answer, feedback: '上次尝试出错：' + e.message + '，请重新给出完整答案。' };
             }
             if (!best || (res.passed || 0) > (best.passed || 0)) best = res;
             if (res.ok) { best = res; break; }
         }
-        return best || { ok: false, passed: 0, total: 0, error: '无结果' };
+        return best || { ok: false, passed: 0, total: 0 };
     }
 
     /* ============================ UI ============================ */
-    let panel, fab, statusEl, titleEl, codeWrap, verdictEl, grindEl, btnSolve, btnGrind, busy = false;
+    let panel, fab, statusEl, titleEl, codeWrap, verdictEl, grindEl, btnSolve, btnGrind, busy = false, _tick = null;
 
-    let _tick = null;
     function setStatus(text, kind, spin) { if (_tick) { clearInterval(_tick); _tick = null; } statusEl.className = kind || ''; statusEl.innerHTML = (spin ? '<span class="cgai-spin"></span>' : '') + text; }
-    // 带「已用时 Ns」实时计时的忙碌状态——避免看起来像卡死
     function tickStatus(prefix, kind) {
         if (_tick) clearInterval(_tick);
         const t0 = Date.now();
-        const render = () => { const s = Math.round((Date.now() - t0) / 1000); statusEl.className = kind || 'busy'; statusEl.innerHTML = '<span class="cgai-spin"></span>' + prefix + `（已用时 ${s}s）`; };
+        const render = () => { statusEl.className = kind || 'busy'; statusEl.innerHTML = '<span class="cgai-spin"></span>' + prefix + `（已用时 ${Math.round((Date.now() - t0) / 1000)}s）`; };
         render(); _tick = setInterval(render, 1000);
     }
     function showVerdictCard(html) { verdictEl.innerHTML = html ? '<div class="cgai-vcard">' + html + '</div>' : ''; }
@@ -439,130 +528,144 @@
         if ((r.passed || 0) > 0) return ICON.warn + `部分通过 ${r.passed}/${r.total}` + (r.score ? ` · 得分 ${r.score}` : '');
         return ICON.err + (r.error ? '失败：' + r.error : '未通过');
     }
+    const KIND_CN = { file: '编程题', iface: '接口题', gap: '填空题' };
 
-    /* ---- 单题：解本题 ---- */
     async function runSolveCurrent() {
         if (busy) return; busy = true;
         verdictEl.innerHTML = ''; codeWrap.style.display = 'none';
         try {
             btnSolve.disabled = true; btnGrind.disabled = true;
             if (!ensureConfig()) return; const apiKey = getKey();
+            const kind = pageType();
+            if (!kind) { setStatus('当前不是题目页，无法解题（可用「一键开刷全部」）。', 'err'); return; }
             const s = settings();
             setStatus('正在提取题目…', 'busy', true);
-            const problem = extractProblem(), ids = extractIds();
-            titleEl.innerHTML = ICON.file + '<span>' + esc(problem.title) + '</span>';
-            if (!problem.statement || problem.statement.length < 5) { setStatus('未能提取题面，请确认在编程题页面。', 'err'); return; }
+            const problem = extractFor(kind), ids = extractIds(kind);
+            titleEl.innerHTML = ICON.file + `<span>[${KIND_CN[kind]}] ` + esc(problem.title) + '</span>';
             if (!ids.problemID || !ids.assignID) { setStatus('未能解析 problemID/assignID。', 'err'); return; }
+            if (kind === 'gap' && !problem.gaps) { setStatus('未识别到填空空位。', 'err'); return; }
+            if (kind !== 'gap' && (!problem.statement || problem.statement.length < 5)) { setStatus('未能提取题面。', 'err'); return; }
 
-            if (!s.autoSubmit) {
+            if (!s.autoSubmit && kind !== 'gap') {
                 tickStatus(`正在调用 ${s.model} 生成代码…`);
-                const code = parseJavaCode(await callDeepSeek(problem, { model: s.model, thinking: s.thinking, temperature: 0 }, apiKey));
-                const mc = detectMainClass(code); fillOnly(code, mc);
+                const code = parseJavaCode(await callLLM(buildMessages(problem, null), { model: s.model, thinking: s.thinking, temperature: 0 }, apiKey));
+                const mc = (kind === 'iface' && problem.mainClass) ? problem.mainClass : detectMainClass(code); fillOnly(code, mc);
                 codeWrap.querySelector('.cgai-code').textContent = code;
                 codeWrap.querySelector('summary').textContent = `生成代码 · 主类 ${mc}`; codeWrap.style.display = 'block';
-                setStatus(`代码已生成并填入表单（主类 ${mc}）。已关闭自动提交——请检查后手动点"提 交"。`, 'ok'); return;
+                setStatus(`代码已生成并填入（主类 ${mc}）。已关闭自动提交——请检查后手动点"提 交"。`, 'ok'); return;
             }
-            const r = await solveCurrent(problem, ids, s, (i, n, opt) =>
-                tickStatus(`第 ${i}/${n} 版：${opt.model}${opt.thinking ? '·思考' : ''} 生成并提交中…`));
-            if (r.code) { codeWrap.querySelector('.cgai-code').textContent = r.code; codeWrap.querySelector('summary').textContent = `生成代码 · 主类 ${r.mainClass} · 第 ${r.attempt} 版`; codeWrap.style.display = 'block'; }
+            const r = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`第 ${i}/${n} 版：${opt.model}${opt.thinking ? '·思考' : ''} 生成并提交中…`));
+            if (r.display) { codeWrap.querySelector('.cgai-code').textContent = r.display; codeWrap.querySelector('summary').textContent = `生成答案 · 第 ${r.attempt} 版`; codeWrap.style.display = 'block'; }
             setStatus(verdictBadge(r), r.ok ? 'ok' : ((r.passed || 0) > 0 ? 'busy' : 'err'));
             showVerdictCard(r.verdict && r.verdict.content);
         } catch (e) { setStatus('出错：' + (e.message || e), 'err'); }
         finally { busy = false; btnSolve.disabled = !isProblemPage(); btnGrind.disabled = false; }
     }
+    // problemID/assignID（各题型一致：iframe src 或页面内联）
+    function extractIds() {
+        let problemID = '', assignID = '';
+        const fr = document.getElementById('showmessageFRAME') || document.getElementById('showmessageFrame');
+        const src = fr ? (fr.getAttribute('src') || '') : '';
+        let m = src.match(/problemID=(\d+)/); if (m) problemID = m[1];
+        m = src.match(/assignID=(\d+)/); if (m) assignID = m[1];
+        if (!assignID) { m = location.search.match(/assignID=(\d+)/); if (m) assignID = m[1]; }
+        if (!problemID) { m = document.body.innerHTML.match(/problemID["'=\s]+(\d+)/); if (m) problemID = m[1]; }
+        return { problemID, assignID };
+    }
 
-    /* ---- 开刷：跨页状态机 ---- */
+    /* ---- 开刷：跨页状态机（队列已校验+排序） ---- */
+    const gkey = (a, p) => a + ':' + p;
+    function navTo(it) { location.assign(`/assignment/${it.page}?proNum=${it.proNum}&assignID=${it.assignID}`); }
     async function startGrind() {
         if (!ensureConfig()) return;
-        setStatus('正在准备作业列表…', 'busy', true);
-        let assignList = isProblemPage() ? discoverAssignList() : [];
-        if (!assignList.length) assignList = await fetchAssignList();
-        if (!assignList.length) { setStatus('未能获取作业列表。请在某道题目页再试。', 'err'); return; }
-        setGrind({ active: true, assignList, done: {}, navs: 0, startedAt: Date.now(), settings: settings() });
-        navProblem(assignList[0], 1);
+        tickStatus('正在读取作业列表并校验题目链接…');
+        let queue; try { queue = await buildQueue(); } catch (e) { setStatus('读取作业列表失败：' + e.message, 'err'); return; }
+        if (!queue || !queue.length) { setStatus('未发现任何题目链接（请确认已登录且已进入该课程）。', 'err'); return; }
+        setGrind({ active: true, queue, done: {}, navs: 0, startedAt: Date.now(), settings: settings() });
+        renderGrind(); refreshButtons();
+        navTo(queue[0]);
     }
     function stopGrind() { const g = getGrind(); if (g) { g.active = false; setGrind(g); } renderGrind(); setStatus('已停止开刷。', ''); refreshButtons(); }
-    function navProblem(assignID, proNum) { location.assign(`/assignment/programList.jsp?proNum=${proNum}&assignID=${assignID}`); }
-    function computeNext(assignList, cur, maxP) {
-        const p = +cur.proNum;
-        if (p < maxP) return { assignID: cur.assignID, proNum: p + 1 };
-        const i = assignList.indexOf(cur.assignID);
-        if (i >= 0 && i + 1 < assignList.length) return { assignID: assignList[i + 1], proNum: 1 };
-        return null;
-    }
-    function gkey(a, p) { return a + ':' + p; }
+    function finishGrind(g) { g.active = false; setGrind(g); renderGrind(); const done = Object.values(g.done); const full = done.filter(r => r.ok || r.skipped).length; setStatus(ICON.ok + `开刷完成！满分 ${full}/${done.length} 题。`, 'ok'); refreshButtons(); }
     function renderGrind() {
-        const g = getGrind(); if (!g) { grindEl.innerHTML = ''; return; }
-        const cur = getCur(); const entries = Object.entries(g.done);
-        const total = entries.length;
-        const full = entries.filter(([, r]) => r.ok || r.skipped).length;
-        let rows = '';
-        for (const [k, r] of entries) {
-            const cls = r.skipped ? 'skip' : (r.ok ? 'ok' : ((r.passed || 0) > 0 ? 'fail' : 'fail'));
-            const ic = r.skipped ? ICON.skip : (r.ok ? ICON.ok : ((r.passed || 0) > 0 ? ICON.warn : ICON.err));
-            const sc = r.skipped ? '跳过' : (r.total ? `${r.passed}/${r.total}` : (r.error ? '失败' : '—'));
-            rows += `<div class="cgai-grow ${cls}"><span>${ic}</span><span class="gk">${esc(k)}</span><span class="gt">${esc(r.title || '')}</span><span class="gs">${sc}</span></div>`;
-        }
-        if (g.active && cur.assignID && cur.proNum && !g.done[gkey(cur.assignID, cur.proNum)]) {
-            rows += `<div class="cgai-grow cur"><span class="cgai-spin"></span><span class="gk">${esc(cur.assignID + ':' + cur.proNum)}</span><span class="gt">处理中…</span><span class="gs"></span></div>`;
-        }
-        grindEl.innerHTML = `<div class="cgai-ghead"><span>${g.active ? '开刷进行中' : '开刷已停止'} · 作业 ${g.assignList.join('/')}</span><span>满分 ${full}/${total}</span></div><div class="cgai-glist">${rows}</div>`;
+        const g = getGrind(); if (!g || !g.queue) { grindEl.innerHTML = ''; return; }
+        const cur = getCur();
+        let rows = '', full = 0;
+        g.queue.forEach(it => {
+            const k = gkey(it.assignID, it.proNum), r = g.done[k];
+            const isCur = it.assignID === cur.assignID && String(it.proNum) === String(cur.proNum);
+            let cls = '', ic = '', sc = '';
+            if (r) {
+                if (r.ok || r.skipped) full++;
+                cls = r.skipped ? 'skip' : (r.ok ? 'ok' : 'fail');
+                ic = r.skipped ? ICON.skip : (r.ok ? ICON.ok : ICON.warn);
+                sc = r.skipped ? '跳过' : (r.total ? `${r.passed}/${r.total}` : (r.error ? '失败' : '—'));
+            } else if (isCur && g.active && busy) { cls = 'cur'; ic = '<span class="cgai-spin"></span>'; sc = ''; }
+            else { ic = ''; sc = '待办'; }
+            rows += `<div class="cgai-grow ${cls}${isCur ? ' cur' : ''}"><span>${ic}</span><span class="gk">${it.assignID}:${it.proNum}</span><span class="gt">${esc((r && r.title) || '')}</span><span class="gs">${sc}</span></div>`;
+        });
+        grindEl.innerHTML = `<div class="cgai-ghead"><span>${g.active ? '开刷进行中' : '开刷已停止'} · ${g.queue.length} 题</span><span>满分 ${full}/${g.queue.length}</span></div><div class="cgai-glist">${rows}</div>`;
     }
     async function grindStep() {
         const g = getGrind(); if (!g || !g.active) return;
         if (busy) return; busy = true; refreshButtons();
         try {
-            const cur = getCur();
-            if (!cur.assignID || !cur.proNum) return;
-            const k = gkey(cur.assignID, cur.proNum);
-            const s = g.settings || settings();
-            const problem = extractProblem(), ids = extractIds();
-            titleEl.innerHTML = ICON.file + '<span>' + esc(problem.title) + '</span>';
-
+            const cur = getCur(), kind = pageType();
+            const qi = g.queue.findIndex(it => it.assignID === cur.assignID && String(it.proNum) === String(cur.proNum));
+            if (qi < 0) { const nxt = g.queue.find(it => !g.done[gkey(it.assignID, it.proNum)]); if (nxt) navTo(nxt); else finishGrind(g); return; }
+            // 页型与队列不符（落到空页）→ 跳到正确页型链接自愈
+            if (kind && PAGE_OF[kind] !== g.queue[qi].page) { navTo(g.queue[qi]); return; }
+            const k = gkey(cur.assignID, cur.proNum), s = g.settings || settings();
             if (!g.done[k]) {
+                const problem = extractFor(kind), ids = extractIds();
+                titleEl.innerHTML = ICON.file + `<span>[${KIND_CN[kind]}] ` + esc(problem.title) + '</span>';
+                renderGrind();
                 let r;
-                // 跳过已满分
-                if (s.skipPassed) {
-                    let pv = null; try { pv = parseVerdict(await fetchVerdict(ids.assignID, ids.problemID)); } catch (_) {}
-                    const sc = scoreOf(pv && pv.content || '');
-                    if (sc.total > 0 && sc.passed === sc.total) r = { skipped: true, ...sc, title: problem.title };
-                }
+                if (s.skipPassed) { const pv = parseVerdict(await fetchVerdict(ids.assignID, ids.problemID)); const sc = scoreOf(pv && pv.content || ''); if (sc.total > 0 && sc.passed === sc.total) r = { skipped: true, ...sc, title: problem.title }; }
                 if (!r) {
-                    renderGrind();
-                    const res = await solveCurrent(problem, ids, s, (i, n, opt) =>
-                        tickStatus(`开刷 ${k}：第 ${i}/${n} 版（${opt.model}${opt.thinking ? '·思考' : ''}）…`));
+                    const res = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`开刷 ${k}：第 ${i}/${n} 版（${opt.model}${opt.thinking ? '·思考' : ''}）…`));
                     r = { ok: res.ok, passed: res.passed, total: res.total, score: res.score, error: res.error, attempt: res.attempt, title: problem.title };
                     if (res.verdict) showVerdictCard(res.verdict.content);
                 }
                 g.done[k] = r; setGrind(g); renderGrind();
             }
-            // 下一题
-            const maxP = discoverProNums();
-            const next = computeNext(g.assignList, cur, maxP);
+            const next = g.queue.slice(qi + 1).find(it => !g.done[gkey(it.assignID, it.proNum)]);
             g.navs = (g.navs || 0) + 1;
-            if (next && g.navs < 80) {
-                setGrind(g);
-                let left = 3; setStatus(`${k} 完成。${left}s 后跳转 ${next.assignID}:${next.proNum}…`, 'busy');
-                const timer = setInterval(() => {
-                    const gg = getGrind(); if (!gg || !gg.active) { clearInterval(timer); return; }
-                    left--; if (left <= 0) { clearInterval(timer); navProblem(next.assignID, next.proNum); }
-                    else setStatus(`${k} 完成。${left}s 后跳转 ${next.assignID}:${next.proNum}…（点"停止开刷"可中断）`, 'busy');
-                }, 1000);
-            } else {
-                g.active = false; setGrind(g); renderGrind();
-                const full = Object.values(g.done).filter(r => r.ok || r.skipped).length;
-                setStatus(ICON.ok + `开刷完成！满分 ${full}/${Object.keys(g.done).length} 题。`, 'ok');
-            }
+            if (next && g.navs < 300) {
+                setGrind(g); let left = 3;
+                const tip = () => setStatus(`${k} 完成。${left}s 后跳转 ${next.assignID}:${next.proNum}…（点"停止开刷"可中断）`, 'busy');
+                tip();
+                const timer = setInterval(() => { const gg = getGrind(); if (!gg || !gg.active) { clearInterval(timer); return; } if (--left <= 0) { clearInterval(timer); navTo(next); } else tip(); }, 1000);
+            } else finishGrind(g);
         } catch (e) { setStatus('开刷出错：' + (e.message || e), 'err'); }
         finally { busy = false; refreshButtons(); }
     }
-
     function refreshButtons() {
-        const g = getGrind(); const grinding = !!(g && g.active);
+        const g = getGrind(), grinding = !!(g && g.active);
         btnSolve.disabled = busy || !isProblemPage();
         if (grinding) { btnGrind.className = 'cgai-btn cgai-btn-danger'; btnGrind.innerHTML = ICON.stop + '<span>停止开刷</span>'; btnGrind.onclick = stopGrind; btnGrind.disabled = false; }
         else { btnGrind.className = 'cgai-btn cgai-btn-ghost'; btnGrind.innerHTML = ICON.grind + '<span>一键开刷全部</span>'; btnGrind.onclick = startGrind; btnGrind.disabled = busy; }
     }
+
+    /* ---- 配置页 ---- */
+    function updateModelTxt() { const t = panel && panel.querySelector('#cgai-modeltxt'); if (t) t.textContent = settings().model || '设置模型'; }
+    function openConfig() {
+        panel.querySelector('#cfg-base').value = getBaseURL();
+        panel.querySelector('#cfg-key').value = getKey();
+        panel.querySelector('#cfg-model').value = settings().model;
+        panel.querySelector('#cfg-strong').value = settings().strongModel;
+        panel.querySelector('#cgai-config').classList.add('open');
+        setTimeout(() => panel.querySelector(getKey() ? '#cfg-base' : '#cfg-key').focus(), 30);
+    }
+    function closeConfig() { panel.querySelector('#cgai-config').classList.remove('open'); }
+    function saveConfig() {
+        GM_setValue(STORE.BASE_URL, panel.querySelector('#cfg-base').value.trim().replace(/\/+$/, '') || DEFAULTS.baseURL);
+        GM_setValue(STORE.KEY, panel.querySelector('#cfg-key').value.trim());
+        GM_setValue(STORE.MODEL, panel.querySelector('#cfg-model').value.trim() || DEFAULTS.model);
+        GM_setValue(STORE.STRONG_MODEL, panel.querySelector('#cfg-strong').value.trim());
+        updateModelTxt(); closeConfig(); setStatus('配置已保存。', 'ok');
+    }
+    function ensureConfig() { if (getKey()) return true; openConfig(); setStatus('请先在配置页填写 API Key 再使用。', 'busy'); return false; }
 
     function buildPanel() {
         panel = document.createElement('div'); panel.id = 'cgai-panel';
@@ -570,7 +673,7 @@
             <div id="cgai-head">
                 <div class="cgai-brand"><span class="cgai-badge">${ICON.brand}</span>
                     <span class="cgai-titles"><b>CG AI 解题</b><i>DeepSeek 自动解题 · 开刷</i></span></div>
-                <span class="cgai-tools"><span class="cgai-ic" id="cgai-cfg" title="设置 API Key">${ICON.settings}</span>
+                <span class="cgai-tools"><span class="cgai-ic" id="cgai-cfg" title="配置">${ICON.settings}</span>
                     <span class="cgai-ic" id="cgai-min" title="收起">${ICON.minus}</span></span>
             </div>
             <div id="cgai-body">
@@ -588,26 +691,19 @@
                 <div id="cgai-title"></div>
                 <div id="cgai-status"></div>
                 <div id="cgai-grind"></div>
-                <details class="cgai-sec" id="cgai-codewrap" style="display:none"><summary>生成代码</summary><pre class="cgai-code"></pre></details>
+                <details class="cgai-sec" id="cgai-codewrap" style="display:none"><summary>生成答案</summary><pre class="cgai-code"></pre></details>
                 <div id="cgai-verdict"></div>
             </div>
             <div id="cgai-config">
-                <div class="cfg-head"><div><b>配置</b> <span class="sub">OpenAI 兼容</span></div>
-                    <span class="cgai-ic" id="cfg-x" title="关闭">${ICON.minus}</span></div>
+                <div class="cfg-head"><div><b>配置</b> <span class="sub">OpenAI 兼容</span></div><span class="cgai-ic" id="cfg-x" title="关闭">${ICON.minus}</span></div>
                 <div class="cfg-body">
-                    <div class="cgai-field"><label>API Base URL</label>
-                        <input id="cfg-base" type="text" spellcheck="false" placeholder="https://api.deepseek.com">
-                        <span class="hint">会调用 &lt;BaseURL&gt;/chat/completions。换成其他 OpenAI 兼容服务即可（DeepSeek 时才发送 thinking 参数）。</span></div>
-                    <div class="cgai-field"><label>API Key</label>
-                        <input id="cfg-key" type="password" spellcheck="false" placeholder="sk-..."></div>
-                    <div class="cgai-field"><label>主模型</label>
-                        <input id="cfg-model" type="text" list="cgai-models" spellcheck="false" placeholder="deepseek-v4-flash"></div>
-                    <div class="cgai-field"><label>重试强模型（可选，失败时升级用）</label>
-                        <input id="cfg-strong" type="text" list="cgai-models" spellcheck="false" placeholder="deepseek-v4-pro"></div>
+                    <div class="cgai-field"><label>API Base URL</label><input id="cfg-base" type="text" spellcheck="false" placeholder="https://api.deepseek.com"><span class="hint">调用 &lt;BaseURL&gt;/chat/completions；可换任意 OpenAI 兼容服务（DeepSeek 时才发送 thinking 参数）。</span></div>
+                    <div class="cgai-field"><label>API Key</label><input id="cfg-key" type="password" spellcheck="false" placeholder="sk-..."></div>
+                    <div class="cgai-field"><label>主模型</label><input id="cfg-model" type="text" list="cgai-models" spellcheck="false" placeholder="deepseek-v4-flash"></div>
+                    <div class="cgai-field"><label>重试强模型（可选，失败时升级用）</label><input id="cfg-strong" type="text" list="cgai-models" spellcheck="false" placeholder="deepseek-v4-pro"></div>
                     <datalist id="cgai-models"></datalist>
                 </div>
-                <div class="cgai-btns"><button class="cgai-btn cgai-btn-primary" id="cfg-save">保存</button>
-                    <button class="cgai-btn cgai-btn-ghost" id="cfg-cancel">取消</button></div>
+                <div class="cgai-btns"><button class="cgai-btn cgai-btn-primary" id="cfg-save">保存</button><button class="cgai-btn cgai-btn-ghost" id="cfg-cancel">取消</button></div>
             </div>`;
         document.body.appendChild(panel);
         fab = document.createElement('div'); fab.id = 'cgai-fab'; fab.innerHTML = ICON.brand + '<span>AI 解题</span>'; document.body.appendChild(fab);
@@ -638,29 +734,9 @@
         makeDraggable(panel, panel.querySelector('#cgai-head'));
 
         refreshButtons(); renderGrind();
-        if (!isProblemPage()) setStatus('进入编程题页面可"解本题"；任意页可"一键开刷全部"。', '');
-        else setStatus('就绪。点"解本题"或"一键开刷全部"。', '');
+        const k = pageType();
+        setStatus(k ? `当前：${KIND_CN[k]}。点"解本题"或"一键开刷全部"。` : '任意页可"一键开刷全部"（会先读取作业列表）。', '');
     }
-    function updateModelTxt() { const t = panel && panel.querySelector('#cgai-modeltxt'); if (t) t.textContent = settings().model || '设置模型'; }
-    function openConfig() {
-        panel.querySelector('#cfg-base').value = getBaseURL();
-        panel.querySelector('#cfg-key').value = getKey();
-        panel.querySelector('#cfg-model').value = settings().model;
-        panel.querySelector('#cfg-strong').value = settings().strongModel;
-        panel.querySelector('#cgai-config').classList.add('open');
-        setTimeout(() => panel.querySelector(getKey() ? '#cfg-base' : '#cfg-key').focus(), 30);
-    }
-    function closeConfig() { panel.querySelector('#cgai-config').classList.remove('open'); }
-    function saveConfig() {
-        const base = panel.querySelector('#cfg-base').value.trim().replace(/\/+$/, '') || DEFAULTS.baseURL;
-        GM_setValue(STORE.BASE_URL, base);
-        GM_setValue(STORE.KEY, panel.querySelector('#cfg-key').value.trim());
-        GM_setValue(STORE.MODEL, panel.querySelector('#cfg-model').value.trim() || DEFAULTS.model);
-        GM_setValue(STORE.STRONG_MODEL, panel.querySelector('#cfg-strong').value.trim());
-        updateModelTxt(); closeConfig(); setStatus('配置已保存。', 'ok');
-    }
-    // 未填 Key 时打开配置页（取代浏览器 prompt 弹窗）
-    function ensureConfig() { if (getKey()) return true; openConfig(); setStatus('请先在配置页填写 API Key 再使用。', 'busy'); return false; }
     function makeDraggable(el, handle) {
         let sx, sy, ox, oy, drag = false;
         handle.addEventListener('mousedown', e => { drag = true; sx = e.clientX; sy = e.clientY; const r = el.getBoundingClientRect(); ox = r.left; oy = r.top; el.style.right = 'auto'; el.style.bottom = 'auto'; el.style.left = ox + 'px'; el.style.top = oy + 'px'; e.preventDefault(); });
@@ -668,20 +744,17 @@
         document.addEventListener('mouseup', () => drag = false);
     }
 
-    /* ============================ 菜单 ============================ */
     GM_registerMenuCommand('配置 (Base URL / API Key / 模型)', () => { if (panel) openConfig(); });
-    GM_registerMenuCommand('停止开刷 / 清除进度', () => { clearGrind(); if (grindEl) renderGrind(); if (statusEl) setStatus('已清除开刷进度。', ''); refreshButtons && refreshButtons(); });
+    GM_registerMenuCommand('停止开刷 / 清除进度', () => { clearGrind(); if (grindEl) renderGrind(); if (statusEl) setStatus('已清除开刷进度。', ''); if (btnGrind) refreshButtons(); });
 
-    /* ============================ 测试钩子（生产无副作用） ============================ */
     if (typeof window !== 'undefined' && window.__CGAI_EXPOSE__) {
-        window.__CGAI_API__ = { htmlToText, extractProblem, extractIds, getCur, discoverProNums, discoverAssignList, parseJavaCode, detectMainClass, parseVerdict, scoreOf, buildMessages, computeNext, ladderFor };
+        window.__CGAI_API__ = { htmlToText, titleOf, extractStatement, extractGap, extractFor, extractIds, getCur, pageType, discoverAssignList, discoverCourseID, fetchAssignProblems, buildQueue, parseJavaCode, detectMainClass, parseGapAnswers, parseVerdict, submitTimeOf, scoreOf, feedbackFromHtml, buildMessages, ladderFor };
     }
 
-    /* ============================ 启动 ============================ */
     function boot() {
         buildPanel();
         const g = getGrind();
-        if (g && g.active && isProblemPage()) setTimeout(grindStep, 1200);
+        if (g && g.active && isProblemPage()) setTimeout(grindStep, 1300);
     }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();

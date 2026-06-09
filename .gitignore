@@ -5,6 +5,7 @@ preview-config.html
 /preview*.png
 /v2-*.png
 think_probe*.mjs
+gap_e2e.mjs
 *.log
 .DS_Store
 .env
