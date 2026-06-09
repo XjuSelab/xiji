@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.1.1
+// @version      2.1.3
 // @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
@@ -332,13 +332,13 @@
         }
         return [{ role: 'system', content: sys }, { role: 'user', content: user }];
     }
-    function callLLM(messages, opts, apiKey) {
+    function callLLM(messages, opts, apiKey, timeoutMs) {
         const baseURL = getBaseURL(), host = baseURL.replace(/^https?:\/\//, '');
         const payload = { model: opts.model, messages, stream: false, temperature: opts.temperature ?? 0, max_tokens: 8192 };
         if (/deepseek/i.test(baseURL)) payload.thinking = { type: opts.thinking ? 'enabled' : 'disabled' };
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
-                method: 'POST', url: baseURL + '/chat/completions', data: JSON.stringify(payload), responseType: 'text', timeout: 120000,
+                method: 'POST', url: baseURL + '/chat/completions', data: JSON.stringify(payload), responseType: 'text', timeout: Math.max(8000, timeoutMs || 120000),
                 headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
                 onload: r => {
                     if (r.status === 401) return reject(new Error('API Key 无效 (401)，请到配置页检查'));
@@ -406,9 +406,9 @@
     }
     const submitTimeOf = c => { const m = (c || '').match(/最后一次提交时间[:：]\s*([0-9][0-9\-\s:]+)/); return m ? m[1].trim() : ''; };
     // 用「最后一次提交时间」作为新鲜度判据——避免重复提交内容相同时永远等不到（旧版卡死根因）
-    async function pollVerdict(assignID, problemID, baselineTime) {
-        const deadline = Date.now() + 90000;
-        await sleep(2500);
+    async function pollVerdict(assignID, problemID, baselineTime, hardDeadline) {
+        const deadline = Math.min(Date.now() + 90000, hardDeadline || (Date.now() + 90000));
+        await sleep(Math.min(2500, Math.max(0, deadline - Date.now())));
         let last = null;
         while (Date.now() < deadline) {
             let text = ''; try { text = await fetchVerdict(assignID, problemID); } catch (_) {}
@@ -444,27 +444,43 @@
         let doc; try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch (_) { return ''; }
         const txt = (doc.body && doc.body.textContent) || '';
         if (/编译错误|编译失败|compile error/i.test(txt) && !/成功通过编译/.test(txt)) {
-            const seg = (txt.match(/编译[\s\S]{0,500}/) || [''])[0];
-            return '上次提交【编译错误】：\n' + seg.trim().slice(0, 700) + '\n请修正使其能编译。';
+            const seg = (txt.match(/编译[\s\S]{0,600}/) || [''])[0];
+            return '上次提交【编译错误】：\n' + seg.trim().slice(0, 800) + '\n请修正使其能通过编译后重新输出完整答案。';
         }
-        const wrongs = doc.querySelectorAll('pre[id^="wrongContent"]');
-        for (const w of wrongs) {
+        // 收集所有失败测试点（期望 vs 实际），多样例才能让模型看出规律
+        const cases = [];
+        doc.querySelectorAll('pre[id^="wrongContent"]').forEach(w => {
+            if (cases.length >= 6) return;
             const n = (w.id.match(/wrongContent(\d+)/) || [])[1];
             const r = doc.getElementById('rightContent' + n);
-            const right = (r ? r.textContent : '').slice(0, 1200), wrong = (w.textContent || '').slice(0, 1200);
-            if (right || wrong) return `上次提交在【测试数据${n}】输出错误。\n【期望输出】\n${right}\n【你的输出】\n${wrong}\n请仔细对比差异（注意空格/换行/大小写/精度），修正后重新按要求输出。`;
+            const wrong = (w.textContent || '').replace(/ /g, ' ');
+            const right = (r ? r.textContent : '').replace(/ /g, ' ');
+            if (right.trim() === wrong.trim()) return; // 该点其实一致
+            cases.push(`【测试点${n}】\n期望输出:\n${right.slice(0, 500)}\n实际输出:\n${wrong.slice(0, 500)}`);
+        });
+        if (!cases.length) {
+            if (/运行错误|超时|超时限制|段错误|runtime error|time limit/i.test(txt)) {
+                const seg = (txt.match(/(运行错误|超时|段错误|内存)[\s\S]{0,300}/) || [''])[0];
+                return '上次提交【运行/超时错误】：\n' + seg.trim().slice(0, 500) + '\n请修正后重新输出完整答案。';
+            }
+            return '上次提交未通过，但未取到具体差异。请重新审视题意与输出格式（注意空格/换行/精度）后再试。';
         }
-        return '上次提交未通过，但未取到具体差异。请重新审视题意与输出格式后再试。';
+        return `上次提交未通过。以下是各失败测试点的「期望输出」对比「你的实际输出」（看不到测试输入，请据多个样例推断错误规律）：\n\n${cases.join('\n\n')}\n\n请逐字符对比期望与实际的差异（空格、换行、行尾、大小写、数值与精度、计数是否多/少一），找出共同规律并修正后重新输出完整答案。`;
     }
 
     /* ============================ 解一题（多版本 + 失败读样例） ============================ */
-    // 每一版的模型计划：前面几版「不换模型」只累积上下文纠错；仅最后一版升级到更高模型
+    const PROBLEM_BUDGET_MS = 180000; // 单题总时长上限，超时自动跳过
+    const SAMPLE_DIRECTIVE = '\n\n特别提示：本题描述可能有歧义、或评测就按这些样例来。如果你仍无法从题意推导出通用正确解法，请【面向样例编程】——针对上面各失败测试点的「期望输出」，用条件判断/查表等方式让程序对这些情形给出正确结果（仍必须能正常编译运行，并尽量兼顾未列出的情形）。只输出完整代码/JSON，不要解释。';
+    // 版本计划：v1 直接解；v2 同对话同模型按样例纠错；v3 同对话同模型「面向样例编程」；仅当版本数≥4 时最后一版才升级更高模型
     function planFor(s) {
         const N = Math.max(1, +s.maxAttempts || 1), strong = s.strongModel || s.model;
         const plan = [];
         for (let i = 0; i < N; i++) {
-            const useStrong = (i === N - 1) && strong !== s.model && N >= 2; // 仅最后一版换更高模型
-            plan.push({ model: useStrong ? strong : s.model, thinking: useStrong ? true : s.thinking, temperature: i === 0 ? 0 : (useStrong ? 0 : 0.4), escalate: useStrong });
+            let mode = 'fix', model = s.model, thinking = s.thinking, temperature = 0.4;
+            if (i === 0) { mode = 'normal'; temperature = 0; }
+            else if (i === 2) { mode = 'sample'; } // 第3次：同对话、不换模型、面向样例
+            else if (i === N - 1 && N >= 4 && strong !== s.model) { mode = 'escalate'; model = strong; thinking = true; temperature = 0; }
+            plan.push({ model, thinking, temperature, mode, escalate: mode === 'escalate' });
         }
         return plan;
     }
@@ -472,14 +488,16 @@
     async function solveProblem(kind, problem, ids, s, onAttempt) {
         const apiKey = getKey(), plan = planFor(s);
         const messages = buildMessages(problem); // [system, user(题目)]，后续把每版回复与错误样例追加进同一对话
-        let best = null, baselineTime = '';
+        const t0 = Date.now(), deadline = t0 + PROBLEM_BUDGET_MS;
+        let best = null, baselineTime = '', timedOut = false;
         try { baselineTime = submitTimeOf((parseVerdict(await fetchVerdict(ids.assignID, ids.problemID)) || {}).content); } catch (_) {}
         for (let i = 0; i < plan.length; i++) {
+            if (deadline - Date.now() < 15000) { timedOut = true; break; } // 单题不足 15s 不再起新一版
             const opt = plan[i];
             onAttempt && onAttempt(i + 1, plan.length, opt);
             let res;
             try {
-                const raw = await callLLM(messages, opt, apiKey);
+                const raw = await callLLM(messages, opt, apiKey, deadline - Date.now() - 8000);
                 messages.push({ role: 'assistant', content: raw }); // 模型本版回复留在上下文里
                 let display;
                 if (kind === 'gap') {
@@ -492,13 +510,14 @@
                     const mainClass = (kind === 'iface' && problem.mainClass) ? problem.mainClass : detectMainClass(code);
                     display = code; fillAndSubmit(code, mainClass);
                 }
-                const v = await pollVerdict(ids.assignID, ids.problemID, baselineTime);
+                const v = await pollVerdict(ids.assignID, ids.problemID, baselineTime, deadline);
                 baselineTime = submitTimeOf(v && v.content) || baselineTime;
                 const sc = scoreOf(v && v.content || '');
                 res = { ok: sc.total > 0 && sc.passed === sc.total, ...sc, display, verdict: v, attempt: i + 1 };
-                if (!res.ok && i < plan.length - 1) { // 读错误样例，作为新一轮 user 反馈追加到同一对话
-                    const fb = feedbackFromHtml(await fetchFailDetail(ids.assignID, ids.problemID));
-                    messages.push({ role: 'user', content: fb || '上次提交未通过，请仔细修正后重新输出完整答案。' });
+                if (!res.ok && i < plan.length - 1 && deadline - Date.now() > 15000) { // 读错误样例，作为新一轮 user 反馈追加到同一对话
+                    let fb = feedbackFromHtml(await fetchFailDetail(ids.assignID, ids.problemID)) || '上次提交未通过，请仔细修正后重新输出完整答案。';
+                    if (plan[i + 1] && plan[i + 1].mode === 'sample') fb += SAMPLE_DIRECTIVE; // 下一版起面向样例
+                    messages.push({ role: 'user', content: fb });
                 }
             } catch (e) {
                 res = { ok: false, error: e.message, passed: 0, total: 0, score: null, attempt: i + 1 };
@@ -508,7 +527,9 @@
             if (!best || (res.passed || 0) > (best.passed || 0)) best = res;
             if (res.ok) { best = res; break; }
         }
-        return best || { ok: false, passed: 0, total: 0 };
+        if (!best) best = { ok: false, passed: 0, total: 0 };
+        best.timedOut = timedOut && !best.ok;
+        return best;
     }
 
     /* ============================ UI ============================ */
@@ -525,6 +546,7 @@
     function verdictBadge(r) {
         if (r.skipped) return ICON.skip + '已满分，跳过';
         if (r.ok) return ICON.ok + `满分 · ${r.passed}/${r.total}` + (r.score ? ` · 得分 ${r.score}` : '');
+        if (r.timedOut) return ICON.skip + '超时跳过(>180s)' + ((r.passed || 0) > 0 ? ` · 最好 ${r.passed}/${r.total}` : '');
         if ((r.passed || 0) > 0) return ICON.warn + `部分通过 ${r.passed}/${r.total}` + (r.score ? ` · 得分 ${r.score}` : '');
         return ICON.err + (r.error ? '失败：' + r.error : '未通过');
     }
@@ -554,7 +576,7 @@
                 codeWrap.querySelector('summary').textContent = `生成代码 · 主类 ${mc}`; codeWrap.style.display = 'block';
                 setStatus(`代码已生成并填入（主类 ${mc}）。已关闭自动提交——请检查后手动点"提 交"。`, 'ok'); return;
             }
-            const r = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`第 ${i}/${n} 版${opt.escalate ? '·升级强模型' : (i > 1 ? '·按错误样例纠错' : '')}（${opt.model}${opt.thinking ? '·思考' : ''}）生成提交中…`));
+            const r = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`第 ${i}/${n} 版${opt.mode === 'escalate' ? '·升级强模型' : opt.mode === 'sample' ? '·面向样例编程' : (i > 1 ? '·按错误样例纠错' : '')}（${opt.model}${opt.thinking ? '·思考' : ''}）生成提交中…`));
             if (r.display) { codeWrap.querySelector('.cgai-code').textContent = r.display; codeWrap.querySelector('summary').textContent = `生成答案 · 第 ${r.attempt} 版`; codeWrap.style.display = 'block'; }
             setStatus(verdictBadge(r), r.ok ? 'ok' : ((r.passed || 0) > 0 ? 'busy' : 'err'));
             showVerdictCard(r.verdict && r.verdict.content);
@@ -598,8 +620,8 @@
             if (r) {
                 if (r.ok || r.skipped) full++;
                 cls = r.skipped ? 'skip' : (r.ok ? 'ok' : 'fail');
-                ic = r.skipped ? ICON.skip : (r.ok ? ICON.ok : ICON.warn);
-                sc = r.skipped ? '跳过' : (r.total ? `${r.passed}/${r.total}` : (r.error ? '失败' : '—'));
+                ic = r.skipped ? ICON.skip : (r.ok ? ICON.ok : (r.timedOut ? ICON.skip : ICON.warn));
+                sc = r.skipped ? '跳过' : (r.timedOut ? '超时' : (r.total ? `${r.passed}/${r.total}` : (r.error ? '失败' : '—')));
             } else if (isCur && g.active && busy) { cls = 'cur'; ic = '<span class="cgai-spin"></span>'; sc = ''; }
             else { ic = ''; sc = '待办'; }
             rows += `<div class="cgai-grow ${cls}${isCur ? ' cur' : ''}"><span>${ic}</span><span class="gk">${it.assignID}:${it.proNum}</span><span class="gt">${esc((r && r.title) || '')}</span><span class="gs">${sc}</span></div>`;
@@ -623,8 +645,8 @@
                 let r;
                 if (s.skipPassed) { const pv = parseVerdict(await fetchVerdict(ids.assignID, ids.problemID)); const sc = scoreOf(pv && pv.content || ''); if (sc.total > 0 && sc.passed === sc.total) r = { skipped: true, ...sc, title: problem.title }; }
                 if (!r) {
-                    const res = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`开刷 ${k}·第 ${i}/${n} 版${opt.escalate ? '·升级' : (i > 1 ? '·纠错' : '')}（${opt.model}${opt.thinking ? '·思考' : ''}）…`));
-                    r = { ok: res.ok, passed: res.passed, total: res.total, score: res.score, error: res.error, attempt: res.attempt, title: problem.title };
+                    const res = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`开刷 ${k}·第 ${i}/${n} 版${opt.mode === 'escalate' ? '·升级' : opt.mode === 'sample' ? '·面向样例' : (i > 1 ? '·纠错' : '')}（${opt.model}${opt.thinking ? '·思考' : ''}）…`));
+                    r = { ok: res.ok, passed: res.passed, total: res.total, score: res.score, error: res.error, timedOut: res.timedOut, attempt: res.attempt, title: problem.title };
                     if (res.verdict) showVerdictCard(res.verdict.content);
                 }
                 g.done[k] = r; setGrind(g); renderGrind();

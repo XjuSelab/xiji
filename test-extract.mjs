@@ -55,8 +55,8 @@ console.log('\n[失败反馈 dynamictest]');
     const { api } = load('pl1.html', 'http://10.109.120.139/x');
     const dt = new TextDecoder('gbk').decode(fs.readFileSync(`${DIR}/dt.html`));
     const fb = api.feedbackFromHtml(dt);
-    ok('反馈含 测试数据5', /测试数据5/.test(fb), fb.slice(0, 40));
-    ok('反馈含 期望输出 + 你的输出', /期望输出/.test(fb) && /你的输出/.test(fb));
+    ok('反馈含 测试点5', /测试点5/.test(fb), fb.slice(0, 50));
+    ok('反馈含 期望输出 + 实际输出', /期望输出/.test(fb) && /实际输出/.test(fb));
     ok('反馈含错误输出内容(According)', /According/.test(fb));
 }
 
@@ -65,9 +65,11 @@ console.log('\n[模型梯队 / 判分]');
     const { api } = load('pl1.html', 'http://10.109.120.139/x');
     const L = api.planFor({ model: 'deepseek-v4-flash', strongModel: 'deepseek-v4-pro', thinking: false, maxAttempts: 3 });
     ok('plan=3', L.length === 3);
-    ok('前两版不换模型(flash)', L[0].model === 'deepseek-v4-flash' && L[1].model === 'deepseek-v4-flash' && !L[0].escalate && !L[1].escalate);
-    ok('仅末版升级强模型(pro)', L[2].model === 'deepseek-v4-pro' && L[2].escalate === true);
-    ok('maxAttempts=1 不升级', (() => { const p = api.planFor({ model: 'm', strongModel: 'big', maxAttempts: 1 }); return p.length === 1 && p[0].model === 'm' && !p[0].escalate; })());
+    ok('v1 normal / v2 fix 同模型(flash)', L[0].mode === 'normal' && L[1].mode === 'fix' && L[0].model === 'deepseek-v4-flash' && L[1].model === 'deepseek-v4-flash');
+    ok('v3=面向样例·同模型(不升级)', L[2].mode === 'sample' && L[2].model === 'deepseek-v4-flash' && !L[2].escalate);
+    const L4 = api.planFor({ model: 'deepseek-v4-flash', strongModel: 'deepseek-v4-pro', thinking: false, maxAttempts: 4 });
+    ok('版本≥4 时 v3 面向样例 / v4 升级强模型', L4[2].mode === 'sample' && L4[3].mode === 'escalate' && L4[3].model === 'deepseek-v4-pro');
+    ok('maxAttempts=1 只 normal 不升级', (() => { const p = api.planFor({ model: 'm', strongModel: 'big', maxAttempts: 1 }); return p.length === 1 && p[0].mode === 'normal' && p[0].model === 'm'; })());
     ok('submitTimeOf', api.submitTimeOf('得分20.00 最后一次提交时间:2026-06-09 14:05:42 abc') === '2026-06-09 14:05:42');
     let v = null; try { v = api.parseVerdict(new TextDecoder('gbk').decode(fs.readFileSync(`${DIR}/verdict.json`))); } catch (_) {}
     if (v) { const sc = api.scoreOf(v.content); ok('scoreOf 5/5 得分20.00', sc.passed === 5 && sc.total === 5 && sc.score === '20.00'); }

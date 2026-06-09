@@ -12,3 +12,5 @@ gap_e2e.mjs
 ds_key
 e2e_cookies.txt
 multiturn_demo.mjs
+mt_e2e.mjs
+ex.py
