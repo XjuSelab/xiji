@@ -1,7 +1,10 @@
 node_modules/
 .playwright-mcp/
-/preview.html
+preview.html
+preview-config.html
 /preview*.png
+/v2-*.png
+think_probe*.mjs
 *.log
 .DS_Store
 .env
