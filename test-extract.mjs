@@ -43,6 +43,22 @@ console.log('\n[填空题 programFillGapList]');
     ok('parseGapAnswers 带围栏/杂质', api.parseGapAnswers('好的：\n```json\n{"1":"abstract class","2":"x"}\n```')['2'] === 'x');
 }
 
+console.log('\n[同 assign 双题型：proNum 跨题型重复]');
+{
+    const { api } = load('pl1.html', 'http://10.109.120.139/x');
+    const html = '<a href="programFillGapList.jsp?proNum=1&assignID=53">a</a>' +
+        '<a href="programWithInterfaceList.jsp?proNum=1&assignID=53">b</a>' +
+        '<a href="programFillGapList.jsp?proNum=2&assignID=53">c</a>' +
+        '<a href="programList.jsp?proNum=1&assignID=99">other</a>';
+    const items = api.parseAssignProblems(html, '53');
+    ok('保留3题(两类的 proNum=1 都不丢)', items.length === 3, JSON.stringify(items.map(i => i.page + ':' + i.proNum)));
+    ok('proNum=1 有两条(不同题型)', items.filter(i => i.proNum === 1).length === 2);
+    const k1 = api.itemKey(items.find(i => /FillGap/.test(i.page) && i.proNum === 1));
+    const k2 = api.itemKey(items.find(i => /Interface/.test(i.page) && i.proNum === 1));
+    ok('itemKey 含页型→两条 key 不冲突', k1 !== k2, k1 + ' vs ' + k2);
+    ok('不串入别的 assign(99)', !items.some(i => i.assignID === '99'));
+}
+
 console.log('\n[接口题 programWithInterfaceList — pageType]');
 {
     const { api } = load('pl1.html', 'http://10.109.120.139/assignment/programWithInterfaceList.jsp?proNum=1&assignID=54');

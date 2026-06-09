@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.1.4
+// @version      2.1.5
 // @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
@@ -285,18 +285,22 @@
         return list;
     }
     // 读某作业 index.jsp，提取「实际存在」的题目链接（含正确页型），按 proNum 升序
-    async function fetchAssignProblems(assignID, courseID) {
-        const url = `${OJ}/assignment/index.jsp?${courseID ? 'courseID=' + courseID + '&' : ''}assignID=${assignID}`;
-        const html = await gmGetText(url);
+    // 同一 assign 可能有多种题型（如 53 同时有填空题+接口题），proNum 在不同题型里会重复，
+    // 因此必须按「页型 + proNum」去重/标识，不能只按 proNum（否则会丢题、key 冲突）
+    function parseAssignProblems(html, assignID) {
         const seen = new Set(), items = [];
         const re = /(programList|programFillGapList|programWithInterfaceList)\.jsp\?([^"'\s>]+)/g; let m;
         while ((m = re.exec(html))) {
             const page = m[1] + '.jsp', q = m[2];
             const pn = (q.match(/proNum=(\d+)/) || [])[1], aid = (q.match(/assignID=(\d+)/) || [])[1];
-            if (pn && aid === String(assignID) && !seen.has(pn)) { seen.add(pn); items.push({ assignID: String(assignID), proNum: +pn, page }); }
+            if (pn && aid === String(assignID)) { const key = page + ':' + pn; if (!seen.has(key)) { seen.add(key); items.push({ assignID: String(assignID), proNum: +pn, page }); } }
         }
-        items.sort((a, b) => a.proNum - b.proNum);
+        items.sort((a, b) => a.page.localeCompare(b.page) || a.proNum - b.proNum);
         return items;
+    }
+    async function fetchAssignProblems(assignID, courseID) {
+        const url = `${OJ}/assignment/index.jsp?${courseID ? 'courseID=' + courseID + '&' : ''}assignID=${assignID}`;
+        return parseAssignProblems(await gmGetText(url), assignID);
     }
     async function buildQueue() {
         let assignList = isProblemPage() ? discoverAssignList() : [];
@@ -305,7 +309,7 @@
         const courseID = discoverCourseID();
         const queue = [];
         for (const a of assignList) queue.push(...await fetchAssignProblems(a, courseID));
-        queue.sort((x, y) => (+x.assignID - +y.assignID) || (x.proNum - y.proNum));
+        queue.sort((x, y) => (+x.assignID - +y.assignID) || x.page.localeCompare(y.page) || (x.proNum - y.proNum));
         return queue;
     }
 
@@ -611,7 +615,9 @@
     }
 
     /* ---- 开刷：跨页状态机（队列已校验+排序） ---- */
-    const gkey = (a, p) => a + ':' + p;
+    // 队列项唯一键含页型（同 assign 跨题型 proNum 会重复）
+    const itemKey = it => it.assignID + '|' + it.page + '|' + it.proNum;
+    const TAG = pg => /FillGap/i.test(pg) ? '填' : /Interface/i.test(pg) ? '接' : '编';
     function navTo(it) { location.assign(`/assignment/${it.page}?proNum=${it.proNum}&assignID=${it.assignID}`); }
     async function startGrind() {
         if (!ensureConfig()) return;
@@ -626,11 +632,11 @@
     function finishGrind(g) { g.active = false; setGrind(g); renderGrind(); const done = Object.values(g.done); const full = done.filter(r => r.ok || r.skipped).length; setStatus(ICON.ok + `开刷完成！满分 ${full}/${done.length} 题。`, 'ok'); refreshButtons(); }
     function renderGrind() {
         const g = getGrind(); if (!g || !g.queue) { grindEl.innerHTML = ''; return; }
-        const cur = getCur();
+        const cur = getCur(), curPage = PAGE_OF[pageType()] || '';
         let rows = '', full = 0;
         g.queue.forEach(it => {
-            const k = gkey(it.assignID, it.proNum), r = g.done[k];
-            const isCur = it.assignID === cur.assignID && String(it.proNum) === String(cur.proNum);
+            const k = itemKey(it), r = g.done[k];
+            const isCur = it.assignID === cur.assignID && it.page === curPage && String(it.proNum) === String(cur.proNum);
             let cls = '', ic = '', sc = '';
             if (r) {
                 if (r.ok || r.skipped) full++;
@@ -639,7 +645,7 @@
                 sc = r.skipped ? '跳过' : (r.timedOut ? '超时' : (r.total ? `${r.passed}/${r.total}` : (r.error ? '失败' : '—')));
             } else if (isCur && g.active && busy) { cls = 'cur'; ic = '<span class="cgai-spin"></span>'; sc = ''; }
             else { ic = ''; sc = '待办'; }
-            rows += `<div class="cgai-grow ${cls}${isCur ? ' cur' : ''}"><span>${ic}</span><span class="gk">${it.assignID}:${it.proNum}</span><span class="gt">${esc((r && r.title) || '')}</span><span class="gs">${sc}</span></div>`;
+            rows += `<div class="cgai-grow ${cls}${isCur ? ' cur' : ''}"><span>${ic}</span><span class="gk">${it.assignID}${TAG(it.page)}:${it.proNum}</span><span class="gt">${esc((r && r.title) || '')}</span><span class="gs">${sc}</span></div>`;
         });
         grindEl.innerHTML = `<div class="cgai-ghead"><span>${g.active ? '开刷进行中' : '开刷已停止'} · ${g.queue.length} 题</span><span>满分 ${full}/${g.queue.length}</span></div><div class="cgai-glist">${rows}</div>`;
     }
@@ -647,12 +653,10 @@
         const g = getGrind(); if (!g || !g.active) return;
         if (busy) return; busy = true; refreshButtons();
         try {
-            const cur = getCur(), kind = pageType();
-            const qi = g.queue.findIndex(it => it.assignID === cur.assignID && String(it.proNum) === String(cur.proNum));
-            if (qi < 0) { const nxt = g.queue.find(it => !g.done[gkey(it.assignID, it.proNum)]); if (nxt) navTo(nxt); else finishGrind(g); return; }
-            // 页型与队列不符（落到空页）→ 跳到正确页型链接自愈
-            if (kind && PAGE_OF[kind] !== g.queue[qi].page) { navTo(g.queue[qi]); return; }
-            const k = gkey(cur.assignID, cur.proNum), s = g.settings || settings();
+            const cur = getCur(), kind = pageType(), curPage = PAGE_OF[kind] || '';
+            const qi = g.queue.findIndex(it => it.assignID === cur.assignID && it.page === curPage && String(it.proNum) === String(cur.proNum));
+            if (qi < 0) { const nxt = g.queue.find(it => !g.done[itemKey(it)]); if (nxt) navTo(nxt); else finishGrind(g); return; }
+            const item = g.queue[qi], k = itemKey(item), klabel = `${item.assignID}${TAG(item.page)}:${item.proNum}`, s = g.settings || settings();
             if (!g.done[k]) {
                 const problem = extractFor(kind), ids = extractIds();
                 titleEl.innerHTML = ICON.file + `<span>[${KIND_CN[kind]}] ` + esc(problem.title) + '</span>';
@@ -660,17 +664,18 @@
                 let r;
                 if (s.skipPassed) { const pv = parseVerdict(await fetchVerdict(ids.assignID, ids.problemID)); const sc = scoreOf(pv && pv.content || ''); if (sc.total > 0 && sc.passed === sc.total) r = { skipped: true, ...sc, title: problem.title }; }
                 if (!r) {
-                    const res = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`开刷 ${k}·第 ${i}/${n} 版${opt.mode === 'escalate' ? '·升级' : opt.mode === 'sample' ? '·面向样例' : (i > 1 ? '·纠错' : '')}（${opt.model}${opt.thinking ? '·思考' : ''}）…`));
+                    const res = await solveProblem(kind, problem, ids, s, (i, n, opt) => tickStatus(`开刷 ${klabel}·第 ${i}/${n} 版${opt.mode === 'escalate' ? '·升级' : opt.mode === 'sample' ? '·面向样例' : (i > 1 ? '·纠错' : '')}（${opt.model}${opt.thinking ? '·思考' : ''}）…`));
                     r = { ok: res.ok, passed: res.passed, total: res.total, score: res.score, error: res.error, timedOut: res.timedOut, attempt: res.attempt, title: problem.title };
                     if (res.verdict) showVerdictCard(res.verdict.content);
                 }
                 g.done[k] = r; setGrind(g); renderGrind();
             }
-            const next = g.queue.slice(qi + 1).find(it => !g.done[gkey(it.assignID, it.proNum)]);
+            const next = g.queue.slice(qi + 1).find(it => !g.done[itemKey(it)]);
             g.navs = (g.navs || 0) + 1;
             if (next && g.navs < 300) {
                 setGrind(g); let left = 3;
-                const tip = () => setStatus(`${k} 完成。${left}s 后跳转 ${next.assignID}:${next.proNum}…（点"停止开刷"可中断）`, 'busy');
+                const nlabel = `${next.assignID}${TAG(next.page)}:${next.proNum}`;
+                const tip = () => setStatus(`${klabel} 完成。${left}s 后跳转 ${nlabel}…（点"停止开刷"可中断）`, 'busy');
                 tip();
                 const timer = setInterval(() => { const gg = getGrind(); if (!gg || !gg.active) { clearInterval(timer); return; } if (--left <= 0) { clearInterval(timer); navTo(next); } else tip(); }, 1000);
             } else finishGrind(g);
@@ -785,7 +790,7 @@
     GM_registerMenuCommand('停止开刷 / 清除进度', () => { clearGrind(); if (grindEl) renderGrind(); if (statusEl) setStatus('已清除开刷进度。', ''); if (btnGrind) refreshButtons(); });
 
     if (typeof window !== 'undefined' && window.__CGAI_EXPOSE__) {
-        window.__CGAI_API__ = { htmlToText, titleOf, extractStatement, extractGap, extractFor, extractIds, getCur, pageType, discoverAssignList, discoverCourseID, fetchAssignProblems, buildQueue, parseJavaCode, detectMainClass, parseGapAnswers, parseVerdict, submitTimeOf, scoreOf, feedbackFromHtml, buildMessages, planFor };
+        window.__CGAI_API__ = { htmlToText, titleOf, extractStatement, extractGap, extractFor, extractIds, getCur, pageType, discoverAssignList, discoverCourseID, parseAssignProblems, fetchAssignProblems, buildQueue, itemKey, parseJavaCode, detectMainClass, parseGapAnswers, parseVerdict, submitTimeOf, scoreOf, feedbackFromHtml, buildMessages, planFor };
     }
 
     function boot() {
