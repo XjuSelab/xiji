@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.1.7
+// @version      2.1.8
 // @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
@@ -471,6 +471,10 @@
         if (/运行错误|超时|超时限制|段错误|runtime error|time limit/i.test(t)) { const seg = (t.match(/(运行错误|超时|超时限制|段错误|内存|runtime error|time limit)[\s\S]{0,400}/i) || [''])[0]; return { type: 'runtime', text: seg.trim() }; }
         return null;
     }
+    // 把空白可视化，让模型能看清「格式/对齐/行尾空格/末尾换行」这类肉眼不可见的差异
+    function visWs(s) {
+        return String(s == null ? '' : s).replace(/ /g, '·').replace(/\t/g, '⇥').replace(/\r/g, '␍').replace(/\n/g, '⏎\n');
+    }
     function feedbackFromHtml(html) {
         if (!html) return '';
         let doc; try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch (_) { return ''; }
@@ -479,16 +483,18 @@
             const seg = (txt.match(/编译[\s\S]{0,600}/) || [''])[0];
             return '上次提交【编译错误】：\n' + seg.trim().slice(0, 800) + '\n请修正使其能通过编译后重新输出完整答案。';
         }
-        // 收集所有失败测试点（期望 vs 实际），多样例才能让模型看出规律
-        const cases = [];
+        const NB = String.fromCharCode(160);
+        const cases = []; let anyFmt = false;
         doc.querySelectorAll('pre[id^="wrongContent"]').forEach(w => {
             if (cases.length >= 6) return;
             const n = (w.id.match(/wrongContent(\d+)/) || [])[1];
             const r = doc.getElementById('rightContent' + n);
-            const wrong = (w.textContent || '').replace(/ /g, ' ');
-            const right = (r ? r.textContent : '').replace(/ /g, ' ');
-            if (right.trim() === wrong.trim()) return; // 该点其实一致
-            cases.push(`【测试点${n}】\n期望输出:\n${right.slice(0, 500)}\n实际输出:\n${wrong.slice(0, 500)}`);
+            const wrong = (w.textContent || '').split(NB).join(' ');
+            const right = (r ? r.textContent : '').split(NB).join(' ');
+            if (right === wrong) return; // 完全一致=该测试点已通过，跳过（不再用 trim 比较，否则会漏掉纯行尾空白差异）
+            const fmtOnly = right.replace(/\s+/g, '') === wrong.replace(/\s+/g, '');
+            if (fmtOnly) anyFmt = true;
+            cases.push(`【测试点${n}】${fmtOnly ? '（内容相同，仅空白/格式不同！注意对齐方式与行尾空白）' : ''}\n期望输出:\n${visWs(right).slice(0, 700)}\n你的输出:\n${visWs(wrong).slice(0, 700)}`);
         });
         if (!cases.length) {
             if (/运行错误|超时|超时限制|段错误|runtime error|time limit/i.test(txt)) {
@@ -497,7 +503,7 @@
             }
             return '上次提交未通过，但未取到具体差异。请重新审视题意与输出格式（注意空格/换行/精度）后再试。';
         }
-        return `上次提交未通过。以下是各失败测试点的「期望输出」对比「你的实际输出」（看不到测试输入，请据多个样例推断错误规律）：\n\n${cases.join('\n\n')}\n\n请逐字符对比期望与实际的差异（空格、换行、行尾、大小写、数值与精度、计数是否多/少一），找出共同规律并修正后重新输出完整答案。`;
+        return `上次提交未通过。下面是各失败测试点「期望输出」对比「你的实际输出」，已把空白可视化：· =空格，⇥=制表符，⏎=每行行尾（看不到测试输入）：\n\n${cases.join('\n\n')}\n\n请严格逐字符对齐格式：每行的空格数与对齐方式（左/右对齐、字段宽度）、行尾是否有多余空格、空行、以及最后一行是否带换行，都必须与期望完全一致。${anyFmt ? '本题内容已正确，纯属格式/空白问题——务必精确复刻期望的空白布局（注意是右对齐还是左对齐、字段宽度、不要多余行尾空格、末尾换行有无）。' : ''}（· ⇥ ⏎ 只是可视标记，请输出真实的空格/制表符/换行，不要输出这些符号本身。）`;
     }
 
     /* ============================ 解一题（多版本 + 失败读样例） ============================ */

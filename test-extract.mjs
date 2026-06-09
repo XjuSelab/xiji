@@ -72,8 +72,12 @@ console.log('\n[失败反馈 dynamictest]');
     const dt = new TextDecoder('gbk').decode(fs.readFileSync(`${DIR}/dt.html`));
     const fb = api.feedbackFromHtml(dt);
     ok('反馈含 测试点5', /测试点5/.test(fb), fb.slice(0, 50));
-    ok('反馈含 期望输出 + 实际输出', /期望输出/.test(fb) && /实际输出/.test(fb));
+    ok('反馈含 期望输出 + 你的输出', /期望输出/.test(fb) && /你的输出/.test(fb));
+    ok('反馈把空白可视化(· 标记)', /·/.test(fb));
     ok('反馈含错误输出内容(According)', /According/.test(fb));
+    // 纯行尾空格差异：不能被漏掉，且要标注「仅空白/格式」
+    const ffb = api.feedbackFromHtml('<pre id="rightContent1">abc</pre><pre id="wrongContent1">abc   </pre>');
+    ok('纯行尾空格差异不漏 + 标注格式', /测试点1/.test(ffb) && /仅空白\/格式/.test(ffb), ffb.slice(0, 80));
 }
 
 console.log('\n[模型梯队 / 判分]');
