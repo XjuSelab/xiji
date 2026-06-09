@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.1.5
+// @version      2.1.6
 // @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
@@ -401,6 +401,11 @@
         Object.keys(answers).forEach(k => p.set('answer' + k, answers[k]));
         return gmSubmit(`${OJ}/assignment/showProcessMsg.jsp`, p.toString(), { 'Content-Type': 'application/x-www-form-urlencoded' });
     }
+    // 提交后让页面自带的「运行结果」iframe 播放原生判题动画（GM_xhr 提交本身不触发它）
+    function showNativeProgress(ids) {
+        const fr = document.getElementById('showmessageFRAME') || document.getElementById('showmessageFrame') || document.querySelector('iframe[name^="showmessage"]');
+        if (fr) try { fr.src = `${OJ}/assignment/longtimerun.jsp?assignID=${ids.assignID}&problemID=${ids.problemID}&doSubmit=true&_=${Date.now()}`; } catch (_) {}
+    }
     // 仅「关闭自动提交」时用：填进页面表单让用户自己点提交
     function fillOnly(code, mainClass) {
         const fileInput = document.getElementById('CGFILE'), mainEl = document.getElementById('javamanclass');
@@ -529,6 +534,7 @@
                     const mainClass = (kind === 'iface' && problem.mainClass) ? problem.mainClass : detectMainClass(code);
                     display = code; await submitFile(ids, code, mainClass);
                 }
+                showNativeProgress(ids); // 恢复页面原生判题动画
                 const v = await pollVerdict(ids.assignID, ids.problemID, baselineTime, deadline);
                 baselineTime = submitTimeOf(v && v.content) || baselineTime;
                 const sc = scoreOf(v && v.content || '');
