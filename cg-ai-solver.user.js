@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.1.6
+// @version      2.1.7
 // @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
@@ -326,8 +326,9 @@
             const mc = problem.mainClass || 'Main';
             const simple = mc.split('.').pop(), pkg = mc.includes('.') ? mc.slice(0, mc.lastIndexOf('.')) : '';
             sys = [common, '',
-                'This is an INTERFACE-IMPLEMENTATION problem. The judge ALREADY PROVIDES hidden framework files — typically the interface named in the problem (and sometimes a driver/other classes).',
-                'CRITICAL: Do NOT redefine the interface named in the problem; redefining a provided type causes a "duplicate class" compile error. Implement only the concrete class(es) you are asked to write.',
+                'This is an INTERFACE-IMPLEMENTATION problem. The judge often (not always) provides hidden framework files — e.g. the interface named in the problem.',
+                'DEFAULT: do NOT redefine the interface named in the problem (if the judge provides it, redefining causes a "duplicate class" compile error). Implement only the concrete class(es).',
+                'BUT this is adaptive via feedback: if a later round reports "cannot find symbol" for that interface/type, it is NOT provided — then DO define it yourself with the exact methods described in the problem. If a round reports "duplicate class", remove your definition of that type.',
                 `Submit ONE source file whose PUBLIC class is \`${simple}\`${pkg ? ' with a `package ' + pkg + ';` declaration' : ''} (saved as ${simple}.java).`,
                 'If the samples show stdin→stdout, give that public class a `main` that reads stdin, computes, and prints EXACTLY the sample output (match the exact format, e.g. "Fee=72.0").',
                 'Other needed helper classes may be top-level non-public in the same file, but NEVER include the provided interface. Output ONLY one fenced ```java code block, no prose. ASCII only unless the sample needs otherwise.'].join('\n');
@@ -463,6 +464,13 @@
             });
         });
     }
+    // 编译/运行错误在判题 content 里（不是 dynamictest）——优先从已拿到的 verdict 提取
+    function verdictError(content) {
+        const t = htmlToText(content || '');
+        if (/编译错误|编译失败|compile error/i.test(t)) { const seg = (t.match(/编译[\s\S]{0,700}/) || [''])[0]; return { type: 'compile', text: seg.trim() }; }
+        if (/运行错误|超时|超时限制|段错误|runtime error|time limit/i.test(t)) { const seg = (t.match(/(运行错误|超时|超时限制|段错误|内存|runtime error|time limit)[\s\S]{0,400}/i) || [''])[0]; return { type: 'runtime', text: seg.trim() }; }
+        return null;
+    }
     function feedbackFromHtml(html) {
         if (!html) return '';
         let doc; try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch (_) { return ''; }
@@ -539,8 +547,10 @@
                 baselineTime = submitTimeOf(v && v.content) || baselineTime;
                 const sc = scoreOf(v && v.content || '');
                 res = { ok: sc.total > 0 && sc.passed === sc.total, ...sc, display, verdict: v, attempt: i + 1 };
-                if (!res.ok && i < plan.length - 1 && deadline - Date.now() > 15000) { // 读错误样例，作为新一轮 user 反馈追加到同一对话
-                    let fb = feedbackFromHtml(await fetchFailDetail(ids.assignID, ids.problemID)) || '上次提交未通过，请仔细修正后重新输出完整答案。';
+                if (!res.ok && i < plan.length - 1 && deadline - Date.now() > 15000) { // 失败反馈追加到同一对话
+                    const ve = verdictError(v && v.content); // 编译/运行错误直接来自 verdict
+                    let fb = ve ? `上次提交【${ve.type === 'compile' ? '编译错误' : '运行/超时错误'}】：\n${ve.text}\n请据此修正后重新输出完整、可编译运行的答案。`
+                        : (feedbackFromHtml(await fetchFailDetail(ids.assignID, ids.problemID)) || '上次提交未通过，请仔细修正后重新输出完整答案。');
                     if (plan[i + 1] && plan[i + 1].mode === 'sample') fb += SAMPLE_DIRECTIVE; // 下一版起面向样例
                     messages.push({ role: 'user', content: fb });
                 }
@@ -796,7 +806,7 @@
     GM_registerMenuCommand('停止开刷 / 清除进度', () => { clearGrind(); if (grindEl) renderGrind(); if (statusEl) setStatus('已清除开刷进度。', ''); if (btnGrind) refreshButtons(); });
 
     if (typeof window !== 'undefined' && window.__CGAI_EXPOSE__) {
-        window.__CGAI_API__ = { htmlToText, titleOf, extractStatement, extractGap, extractFor, extractIds, getCur, pageType, discoverAssignList, discoverCourseID, parseAssignProblems, fetchAssignProblems, buildQueue, itemKey, parseJavaCode, detectMainClass, parseGapAnswers, parseVerdict, submitTimeOf, scoreOf, feedbackFromHtml, buildMessages, planFor };
+        window.__CGAI_API__ = { htmlToText, titleOf, extractStatement, extractGap, extractFor, extractIds, getCur, pageType, discoverAssignList, discoverCourseID, parseAssignProblems, fetchAssignProblems, buildQueue, itemKey, parseJavaCode, detectMainClass, parseGapAnswers, parseVerdict, submitTimeOf, scoreOf, verdictError, feedbackFromHtml, buildMessages, planFor };
     }
 
     function boot() {

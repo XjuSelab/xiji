@@ -87,6 +87,8 @@ console.log('\n[模型梯队 / 判分]');
     ok('版本≥4 时 v3 面向样例 / v4 升级强模型', L4[2].mode === 'sample' && L4[3].mode === 'escalate' && L4[3].model === 'deepseek-v4-pro');
     ok('maxAttempts=1 只 normal 不升级', (() => { const p = api.planFor({ model: 'm', strongModel: 'big', maxAttempts: 1 }); return p.length === 1 && p[0].mode === 'normal' && p[0].model === 'm'; })());
     ok('submitTimeOf', api.submitTimeOf('得分20.00 最后一次提交时间:2026-06-09 14:05:42 abc') === '2026-06-09 14:05:42');
+    ok('verdictError 抓编译错误(verdict里)', (() => { const e = api.verdictError('<font>得分0.00 编译错误. InStudentTest.java:10: error: cannot find symbol class Student implements MoveAble ^ 1 error</font>'); return e && e.type === 'compile' && /cannot find symbol/.test(e.text); })());
+    ok('verdictError 正常通过=null', api.verdictError('得分20.00 共有测试数据:5 测试数据1 完全正确') === null);
     let v = null; try { v = api.parseVerdict(new TextDecoder('gbk').decode(fs.readFileSync(`${DIR}/verdict.json`))); } catch (_) {}
     if (v) { const sc = api.scoreOf(v.content); ok('scoreOf 5/5 得分20.00', sc.passed === 5 && sc.total === 5 && sc.score === '20.00'); }
 }
