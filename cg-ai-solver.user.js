@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
-// @namespace    https://github.com/winbeau/cg-ai-solver
-// @version      1.0.0
+// @namespace    https://github.com/winbeau/xiji
+// @version      1.1.0
 // @description  在 CourseGrading(educg) 编程题页面：提取完整题目 → DeepSeek 生成 Java → 自动填表提交 → 轮询并显示判题结果。
 // @author       winbeau
+// @homepageURL  https://github.com/winbeau/xiji
+// @supportURL   https://github.com/winbeau/xiji/issues
+// @downloadURL  https://feiyue.selab.top/cg-ai-solver.user.js
+// @updateURL    https://feiyue.selab.top/cg-ai-solver.user.js
 // @match        http://10.109.120.139/assignment/programList.jsp*
 // @icon         http://10.109.120.139/images/cgicon.png
 // @grant        GM_xmlhttpRequest
