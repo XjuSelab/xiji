@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.1.3
+// @version      2.1.4
 // @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
@@ -319,11 +319,15 @@
                 'Each value is just the snippet for that blank (do NOT repeat surrounding code). Keep it ASCII. Example: {"1":"abstract class","2":"return this.x;"}'].join('\n');
             user = `${problem.statement ? '【题目说明】\n' + problem.statement + '\n\n' : ''}【带空位的代码】\n${problem.template}\n\n请按上面要求输出 JSON。`;
         } else if (problem.kind === 'iface') {
-            sys = [common, '', 'This is an INTERFACE-IMPLEMENTATION problem. Produce ONE complete, compilable Java source file that includes everything needed (the required interface(s), your implementation, and the main/test class).',
-                'Output ONLY one fenced ```java code block, no prose.',
-                problem.mainClass ? `The entry/main class MUST be \`${problem.mainClass}\`. If it contains a dot, the part before the last dot is the package — add the matching \`package\` declaration; the public class is the part after the last dot.` : 'Use a sensible public main class.',
-                'ASCII only unless the sample output needs otherwise. Read stdin to EOF if the program reads input; reproduce required output exactly.'].join('\n');
-            user = `【题目标题】${problem.title}\n\n【题目内容】\n${problem.statement}\n\n请给出完整、可直接提交的 Java 源文件。`;
+            const mc = problem.mainClass || 'Main';
+            const simple = mc.split('.').pop(), pkg = mc.includes('.') ? mc.slice(0, mc.lastIndexOf('.')) : '';
+            sys = [common, '',
+                'This is an INTERFACE-IMPLEMENTATION problem. The judge ALREADY PROVIDES hidden framework files — typically the interface named in the problem (and sometimes a driver/other classes).',
+                'CRITICAL: Do NOT redefine the interface named in the problem; redefining a provided type causes a "duplicate class" compile error. Implement only the concrete class(es) you are asked to write.',
+                `Submit ONE source file whose PUBLIC class is \`${simple}\`${pkg ? ' with a `package ' + pkg + ';` declaration' : ''} (saved as ${simple}.java).`,
+                'If the samples show stdin→stdout, give that public class a `main` that reads stdin, computes, and prints EXACTLY the sample output (match the exact format, e.g. "Fee=72.0").',
+                'Other needed helper classes may be top-level non-public in the same file, but NEVER include the provided interface. Output ONLY one fenced ```java code block, no prose. ASCII only unless the sample needs otherwise.'].join('\n');
+            user = `【题目标题】${problem.title}\n\n【题目内容】\n${problem.statement}\n\n请给出可直接提交的 Java 源文件（公共类名 ${simple}）。`;
         } else {
             sys = [common, '', 'Produce ONE complete, compilable Java program reading stdin and writing stdout, matching the sample output EXACTLY (every space/blank line/trailing whitespace).',
                 'Output ONLY one fenced ```java code block, no prose.',
@@ -366,27 +370,38 @@
     }
 
     /* ============================ 提交 / 判题 ============================ */
-    function fillAndSubmit(code, mainClass) {
-        const fileInput = document.getElementById('CGFILE'), mainEl = document.getElementById('javamanclass');
-        const btn = document.getElementById('cgSubmitBtn'), form = document.querySelector('form[name="upload"]');
-        if (!fileInput || !btn || !form) throw new Error('未找到文件提交表单');
-        if (mainEl && mainClass) mainEl.value = mainClass;
-        const simple = (mainClass || 'Main').split('.').pop();
-        const dt = new DataTransfer(); dt.items.add(new File([code], simple + '.java', { type: 'text/x-java' }));
-        fileInput.files = dt.files; fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-        if (typeof form.requestSubmit === 'function') form.requestSubmit(btn); else btn.click();
+    // 直接用 GM_xmlhttpRequest 提交（绕开页面那个会被 disable 的提交按钮，避免重试时新代码没真正提交）
+    function gmSubmit(url, body, extraHeaders) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST', url, data: body, timeout: 60000,
+                headers: Object.assign({ 'Referer': location.href }, extraHeaders || {}),
+                onload: r => resolve(r), onerror: () => reject(new Error('提交失败（网络/未授权跨域）')), ontimeout: () => reject(new Error('提交超时')),
+            });
+        });
     }
+    function submitFile(ids, code, mainClass) {
+        const simple = (mainClass || 'Main').split('.').pop();
+        const wtime = Math.max(1, Math.round((Date.now() - pageT0) / 1000));
+        const fd = new FormData();
+        fd.append('FILE1', new Blob([code], { type: 'text/x-java' }), simple + '.java');
+        fd.append('cgSubmitBtn', 'tijiao'); // 不要手动设 Content-Type，让 FormData 自带 boundary
+        const url = `${OJ}/assignment/showProcessMsg.jsp?problemID=${ids.problemID}&assignID=${ids.assignID}&doSubmit=true&progLanguage=java&javaMainCLass=${encodeURIComponent(mainClass || 'Main')}&wtime=${wtime}`;
+        return gmSubmit(url, fd);
+    }
+    function submitGap(ids, answers) {
+        const wtime = Math.max(1, Math.round((Date.now() - pageT0) / 1000));
+        const p = new URLSearchParams();
+        p.set('doSubmit', 'true'); p.set('byCE', 'true'); p.set('wtime', String(wtime));
+        p.set('progLanguage', 'java'); p.set('problemID', ids.problemID); p.set('assignID', ids.assignID);
+        Object.keys(answers).forEach(k => p.set('answer' + k, answers[k]));
+        return gmSubmit(`${OJ}/assignment/showProcessMsg.jsp`, p.toString(), { 'Content-Type': 'application/x-www-form-urlencoded' });
+    }
+    // 仅「关闭自动提交」时用：填进页面表单让用户自己点提交
     function fillOnly(code, mainClass) {
         const fileInput = document.getElementById('CGFILE'), mainEl = document.getElementById('javamanclass');
         if (mainEl && mainClass) mainEl.value = mainClass;
         if (fileInput) { const simple = (mainClass || 'Main').split('.').pop(); const dt = new DataTransfer(); dt.items.add(new File([code], simple + '.java', { type: 'text/x-java' })); fileInput.files = dt.files; fileInput.dispatchEvent(new Event('change', { bubbles: true })); }
-    }
-    function fillGapAndSubmit(answers) {
-        const form = document.getElementById('uploadFORM') || document.querySelector('form[name="uploadFORM"]');
-        if (!form) throw new Error('未找到填空表单 uploadFORM');
-        Object.keys(answers).forEach(k => { const ta = form.querySelector(`textarea[name="answer${k}"]`); if (ta) ta.value = answers[k]; });
-        const w = form.querySelector('[name="wtime"]'); if (w) w.value = Math.max(1, Math.round((Date.now() - pageT0) / 1000));
-        form.submit();
     }
     function fetchVerdict(assignID, problemID) {
         return new Promise((resolve, reject) => {
@@ -503,12 +518,12 @@
                 if (kind === 'gap') {
                     const answers = parseGapAnswers(raw);
                     if (!Object.keys(answers).length) throw new Error('未解析出填空 JSON');
-                    display = JSON.stringify(answers); fillGapAndSubmit(answers);
+                    display = JSON.stringify(answers); await submitGap(ids, answers);
                 } else {
                     const code = parseJavaCode(raw);
                     if (!/class\s+\w+/.test(code)) throw new Error('生成结果不是有效 Java');
                     const mainClass = (kind === 'iface' && problem.mainClass) ? problem.mainClass : detectMainClass(code);
-                    display = code; fillAndSubmit(code, mainClass);
+                    display = code; await submitFile(ids, code, mainClass);
                 }
                 const v = await pollVerdict(ids.assignID, ids.problemID, baselineTime, deadline);
                 baselineTime = submitTimeOf(v && v.content) || baselineTime;

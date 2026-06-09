@@ -47,7 +47,7 @@ console.log('\n[接口题 programWithInterfaceList — pageType]');
 {
     const { api } = load('pl1.html', 'http://10.109.120.139/assignment/programWithInterfaceList.jsp?proNum=1&assignID=54');
     ok('pageType=iface', api.pageType() === 'iface');
-    ok('buildMessages(iface) 用 mainClass', /people\.InStudentTest/.test(api.buildMessages({ kind: 'iface', title: 't', statement: 's', mainClass: 'people.InStudentTest' }, null)[0].content));
+    ok('buildMessages(iface): 主类/包 + 不重定义接口', (() => { const c = api.buildMessages({ kind: 'iface', title: 't', statement: 's', mainClass: 'people.InStudentTest' }, null)[0].content; return /InStudentTest/.test(c) && /package people/.test(c) && /NOT redefine/i.test(c); })());
 }
 
 console.log('\n[失败反馈 dynamictest]');
