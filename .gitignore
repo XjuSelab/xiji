@@ -1,0 +1,9 @@
+node_modules/
+.playwright-mcp/
+/preview.html
+/preview*.png
+*.log
+.DS_Store
+.env
+ds_key
+e2e_cookies.txt
