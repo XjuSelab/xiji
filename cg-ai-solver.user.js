@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.2.0
+// @version      2.2.2
 // @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
@@ -35,8 +35,8 @@
         THINKING: 'ds_thinking', AUTO_SUBMIT: 'cg_auto_submit', MAX_ATTEMPTS: 'cg_max_attempts',
         SKIP_PASSED: 'cg_skip_passed', GRIND: 'cg_grind_state', MODELS_CACHE: 'ds_models_cache',
     };
-    const DEFAULTS = { baseURL: 'https://api.deepseek.com', model: 'deepseek-v4-flash', strongModel: 'deepseek-v4-pro' };
-    const MODEL_SUGGEST = ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner', 'gpt-4o-mini', 'gpt-4o', 'qwen-max'];
+    const DEFAULTS = { baseURL: 'https://aiapis.help/v1', model: 'gpt-5.5', strongModel: 'gpt-5.4-pro' };
+    const MODEL_SUGGEST = ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-pro', 'gpt-5.4-mini'];
     const OJ = location.origin;
     const PAGE_OF = { file: 'programList.jsp', iface: 'programWithInterfaceList.jsp', gap: 'programFillGapList.jsp' };
 
@@ -84,6 +84,8 @@
         err:      svg('<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/>', 15),
         skip:     svg('<polygon points="5 4 15 12 5 20 5 4"/><line x1="19" x2="19" y1="5" y2="19"/>', 14),
         file:     svg('<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h5"/><path d="M16 13H8"/><path d="M16 17H8"/>', 14),
+        arrowUp:  svg('<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>', 15),
+        refresh:  svg('<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/>', 12),
     };
     const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -209,9 +211,22 @@
         .cgai-field select{font-family:var(--cg-font);cursor:pointer;margin-bottom:6px}
         .cgai-field input:focus,.cgai-field select:focus{border-color:var(--cg-link);box-shadow:0 0 0 3px rgba(35,131,226,.14)}
         .cgai-field label{display:flex;align-items:center;justify-content:space-between}
-        .cgai-mini{border:1px solid var(--cg-line);background:var(--cg-bg);color:var(--cg-link);border-radius:999px;
-            padding:2px 9px;font-size:11px;font-weight:600;cursor:pointer;font-family:var(--cg-font)}
+        .cgai-mini{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--cg-line);background:var(--cg-bg);
+            color:var(--cg-link);border-radius:999px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;font-family:var(--cg-font)}
+        .cgai-mini .cgai-svg{vertical-align:-1px}
         .cgai-mini:hover{background:var(--cg-bg-hover)}
+        .cgai-field .hint a{color:var(--cg-link);font-weight:600;text-decoration:none}
+        .cgai-field .hint a:hover{text-decoration:underline}
+        /* 首次使用：指向右上角齿轮的悬浮箭头指引 */
+        #cgai-arrow{position:absolute;top:50px;right:12px;z-index:7;display:none;align-items:center;gap:7px;max-width:300px;
+            background:var(--cg-link);color:#fff;padding:8px 12px;border-radius:var(--cg-r-md);font-size:12px;font-weight:600;
+            line-height:1.35;box-shadow:0 8px 22px rgba(35,131,226,.42);cursor:pointer;animation:cgaibob 1.1s ease-in-out infinite}
+        #cgai-arrow.show{display:flex}
+        #cgai-arrow .cgai-svg{color:#fff;flex:0 0 auto}
+        #cgai-arrow::after{content:'';position:absolute;top:-7px;right:18px;border:7px solid transparent;border-bottom-color:var(--cg-link)}
+        @keyframes cgaibob{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+        #cgai-head .cgai-ic.cgai-attn{color:var(--cg-link);animation:cgaiattn 1.1s ease-in-out infinite}
+        @keyframes cgaiattn{0%,100%{box-shadow:0 0 0 0 rgba(35,131,226,.5)}50%{box-shadow:0 0 0 6px rgba(35,131,226,0)}}
         .cgai-field .hint{font-size:11px;color:var(--cg-faint);line-height:1.4}
     `);
 
@@ -581,7 +596,7 @@
     /* ============================ UI ============================ */
     let panel, fab, statusEl, titleEl, codeWrap, verdictEl, grindEl, btnSolve, btnGrind, busy = false, _tick = null;
 
-    function setStatus(text, kind, spin) { if (_tick) { clearInterval(_tick); _tick = null; } statusEl.className = kind || ''; statusEl.innerHTML = (spin ? '<span class="cgai-spin"></span>' : '') + text; }
+    function setStatus(text, kind, spin) { if (_tick) { clearInterval(_tick); _tick = null; } statusEl.onclick = null; statusEl.style.cursor = ''; statusEl.className = kind || ''; statusEl.innerHTML = (spin ? '<span class="cgai-spin"></span>' : '') + text; }
     function tickStatus(prefix, kind) {
         if (_tick) clearInterval(_tick);
         const t0 = Date.now();
@@ -752,7 +767,18 @@
             ontimeout: () => cfgMsg('拉取超时'),
         });
     }
+    function showOnboarding() {
+        const a = panel.querySelector('#cgai-arrow'), g = panel.querySelector('#cgai-cfg');
+        if (a) a.classList.add('show'); if (g) g.classList.add('cgai-attn');
+        setStatus('还没配置 API Key —— 点右上角齿轮（或上方蓝色箭头）开始，支持 GPT / DeepSeek。', 'busy');
+        statusEl.style.cursor = 'pointer'; statusEl.onclick = openConfig;
+    }
+    function clearOnboarding() {
+        const a = panel.querySelector('#cgai-arrow'), g = panel.querySelector('#cgai-cfg');
+        if (a) a.classList.remove('show'); if (g) g.classList.remove('cgai-attn');
+    }
     function openConfig() {
+        const a = panel.querySelector('#cgai-arrow'); if (a) a.classList.remove('show'); // 配置打开时藏箭头（避免盖在浮层上）
         panel.querySelector('#cfg-base').value = getBaseURL();
         panel.querySelector('#cfg-key').value = getKey();
         populateModelSelects();
@@ -760,14 +786,16 @@
         panel.querySelector('#cgai-config').classList.add('open');
         setTimeout(() => panel.querySelector(getKey() ? '#cfg-base' : '#cfg-key').focus(), 30);
     }
-    function closeConfig() { panel.querySelector('#cgai-config').classList.remove('open'); }
+    function closeConfig() { panel.querySelector('#cgai-config').classList.remove('open'); if (!getKey()) showOnboarding(); }
     function pickModel(selId, inpId, fallback) { const s = panel.querySelector(selId), i = panel.querySelector(inpId); return (s.value === OTHER ? i.value.trim() : s.value) || fallback; }
     function saveConfig() {
         GM_setValue(STORE.BASE_URL, panel.querySelector('#cfg-base').value.trim().replace(/\/+$/, '') || DEFAULTS.baseURL);
         GM_setValue(STORE.KEY, panel.querySelector('#cfg-key').value.trim());
         GM_setValue(STORE.MODEL, pickModel('#cfg-model', '#cfg-model-c', DEFAULTS.model));
         GM_setValue(STORE.STRONG_MODEL, pickModel('#cfg-strong', '#cfg-strong-c', ''));
-        updateModelTxt(); closeConfig(); setStatus('配置已保存。', 'ok');
+        updateModelTxt(); closeConfig();
+        if (getKey()) { clearOnboarding(); setStatus('配置已保存。', 'ok'); }
+        else setStatus('已保存，但 API Key 仍为空——请点齿轮填入。', 'err');
     }
     function ensureConfig() { if (getKey()) return true; openConfig(); setStatus('请先在配置页填写 API Key 再使用。', 'busy'); return false; }
 
@@ -801,9 +829,10 @@
             <div id="cgai-config">
                 <div class="cfg-head"><div><b>配置</b> <span class="sub">OpenAI 兼容</span></div><span class="cgai-ic" id="cfg-x" title="关闭">${ICON.minus}</span></div>
                 <div class="cfg-body">
-                    <div class="cgai-field"><label>API Base URL</label><input id="cfg-base" type="text" spellcheck="false" placeholder="https://api.deepseek.com"><span class="hint">调用 &lt;BaseURL&gt;/chat/completions 与 /models；可换任意 OpenAI 兼容服务（GPT 代理一般要带 /v1，如 https://aiapis.help/v1；DeepSeek 时才发送 thinking 参数）。</span></div>
-                    <div class="cgai-field"><label>API Key</label><input id="cfg-key" type="password" spellcheck="false" placeholder="sk-..."></div>
-                    <div class="cgai-field"><label>主模型 <button class="cgai-mini" id="cfg-fetch" type="button">🔄 刷新模型列表</button></label>
+                    <div class="cgai-field"><label>API Base URL</label><input id="cfg-base" type="text" spellcheck="false" placeholder="https://aiapis.help/v1"><span class="hint">调用 &lt;BaseURL&gt;/chat/completions 与 /models；可换任意 OpenAI 兼容服务（GPT 代理一般要带 /v1，如 https://aiapis.help/v1；DeepSeek 时才发送 thinking 参数）。</span></div>
+                    <div class="cgai-field"><label>API Key</label><input id="cfg-key" type="password" spellcheck="false" placeholder="sk-...">
+                        <span class="hint">没有 Key？去获取：<a href="https://aiapis.help/console" target="_blank" rel="noopener">GPT 系 (aiapis.help/console)</a> · <a href="https://platform.deepseek.com" target="_blank" rel="noopener">DeepSeek 系 (platform.deepseek.com)</a></span></div>
+                    <div class="cgai-field"><label>主模型 <button class="cgai-mini" id="cfg-fetch" type="button">${ICON.refresh}刷新模型列表</button></label>
                         <select id="cfg-model"></select><input id="cfg-model-c" type="text" spellcheck="false" placeholder="自定义模型名" style="display:none">
                         <span class="hint" id="cfg-msg"></span></div>
                     <div class="cgai-field"><label>重试强模型（可选，失败时升级用）</label>
@@ -811,7 +840,11 @@
                 </div>
                 <div class="cgai-btns"><button class="cgai-btn cgai-btn-primary" id="cfg-save">保存</button><button class="cgai-btn cgai-btn-ghost" id="cfg-cancel">取消</button></div>
             </div>`;
+        const arrow = document.createElement('div'); arrow.id = 'cgai-arrow';
+        arrow.innerHTML = ICON.arrowUp + '<span>首次使用：点这里或右上角齿轮，配置 API Key</span>';
+        panel.appendChild(arrow); // 作为 #cgai-panel 的子节点，绝对定位指向右上角齿轮
         document.body.appendChild(panel);
+        arrow.onclick = openConfig;
         fab = document.createElement('div'); fab.id = 'cgai-fab'; fab.innerHTML = ICON.brand + '<span>AI 解题</span>'; document.body.appendChild(fab);
 
         statusEl = panel.querySelector('#cgai-status'); titleEl = panel.querySelector('#cgai-title');
@@ -842,8 +875,8 @@
         makeDraggable(panel, panel.querySelector('#cgai-head'));
 
         refreshButtons(); renderGrind();
-        const k = pageType();
-        setStatus(k ? `当前：${KIND_CN[k]}。点"解本题"或"一键开刷全部"。` : '任意页可"一键开刷全部"（会先读取作业列表）。', '');
+        if (!getKey()) showOnboarding();
+        else { const k = pageType(); setStatus(k ? `当前：${KIND_CN[k]}。点"解本题"或"一键开刷全部"。` : '任意页可"一键开刷全部"（会先读取作业列表）。', ''); }
     }
     function makeDraggable(el, handle) {
         let sx, sy, ox, oy, drag = false;
