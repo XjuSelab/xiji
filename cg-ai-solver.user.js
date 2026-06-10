@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CourseGrading AI 自动解题助手 (DeepSeek)
 // @namespace    https://github.com/winbeau/xiji
-// @version      2.1.8
+// @version      2.2.0
 // @description  希冀(CourseGrading/educg) 编程/填空/接口题：提取题目→DeepSeek 生成→自动提交→读判题结果；一键串行开刷所有作业(校验链接+排序)、失败读样例多版本重试、自动跳题。
 // @author       winbeau
 // @homepageURL  https://github.com/winbeau/xiji
@@ -33,7 +33,7 @@
     const STORE = {
         KEY: 'ds_api_key', BASE_URL: 'ds_base_url', MODEL: 'ds_model', STRONG_MODEL: 'ds_strong_model',
         THINKING: 'ds_thinking', AUTO_SUBMIT: 'cg_auto_submit', MAX_ATTEMPTS: 'cg_max_attempts',
-        SKIP_PASSED: 'cg_skip_passed', GRIND: 'cg_grind_state',
+        SKIP_PASSED: 'cg_skip_passed', GRIND: 'cg_grind_state', MODELS_CACHE: 'ds_models_cache',
     };
     const DEFAULTS = { baseURL: 'https://api.deepseek.com', model: 'deepseek-v4-flash', strongModel: 'deepseek-v4-pro' };
     const MODEL_SUGGEST = ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner', 'gpt-4o-mini', 'gpt-4o', 'qwen-max'];
@@ -204,9 +204,14 @@
         #cgai-config .cfg-body{flex:1;overflow:auto}
         .cgai-field{display:flex;flex-direction:column;gap:5px;margin-bottom:13px}
         .cgai-field label{font-size:12px;color:var(--cg-muted);font-weight:600}
-        .cgai-field input{padding:8px 10px;border:1px solid var(--cg-line);border-radius:var(--cg-r-sm);font-size:13px;
-            font-family:var(--cg-mono);background:var(--cg-bg);color:var(--cg-text);outline:none}
-        .cgai-field input:focus{border-color:var(--cg-link);box-shadow:0 0 0 3px rgba(35,131,226,.14)}
+        .cgai-field input,.cgai-field select{padding:8px 10px;border:1px solid var(--cg-line);border-radius:var(--cg-r-sm);font-size:13px;
+            font-family:var(--cg-mono);background:var(--cg-bg);color:var(--cg-text);outline:none;width:100%}
+        .cgai-field select{font-family:var(--cg-font);cursor:pointer;margin-bottom:6px}
+        .cgai-field input:focus,.cgai-field select:focus{border-color:var(--cg-link);box-shadow:0 0 0 3px rgba(35,131,226,.14)}
+        .cgai-field label{display:flex;align-items:center;justify-content:space-between}
+        .cgai-mini{border:1px solid var(--cg-line);background:var(--cg-bg);color:var(--cg-link);border-radius:999px;
+            padding:2px 9px;font-size:11px;font-weight:600;cursor:pointer;font-family:var(--cg-font)}
+        .cgai-mini:hover{background:var(--cg-bg-hover)}
         .cgai-field .hint{font-size:11px;color:var(--cg-faint);line-height:1.4}
     `);
 
@@ -713,20 +718,55 @@
 
     /* ---- 配置页 ---- */
     function updateModelTxt() { const t = panel && panel.querySelector('#cgai-modeltxt'); if (t) t.textContent = settings().model || '设置模型'; }
+    const OTHER = '__other__';
+    function getModelsCache() { try { return JSON.parse(GM_getValue(STORE.MODELS_CACHE, '') || '[]'); } catch (_) { return []; } }
+    function modelOptions() { const c = settings(); return [...new Set([...getModelsCache(), ...MODEL_SUGGEST, c.model, c.strongModel].filter(Boolean))]; }
+    function fillModelSelect(sel, inp, value) {
+        const list = modelOptions(), inList = list.includes(value);
+        sel.innerHTML = '';
+        [...list, OTHER].forEach(m => { const o = document.createElement('option'); o.value = m; o.textContent = m === OTHER ? '其他 / 自定义…' : m; sel.appendChild(o); });
+        sel.value = inList ? value : (value ? OTHER : list[0]);
+        inp.value = inList ? '' : (value || '');
+        inp.style.display = sel.value === OTHER ? 'block' : 'none';
+    }
+    function syncCustom(sel, inp) { inp.style.display = sel.value === OTHER ? 'block' : 'none'; if (sel.value === OTHER) inp.focus(); }
+    function populateModelSelects() {
+        fillModelSelect(panel.querySelector('#cfg-model'), panel.querySelector('#cfg-model-c'), settings().model);
+        fillModelSelect(panel.querySelector('#cfg-strong'), panel.querySelector('#cfg-strong-c'), settings().strongModel);
+    }
+    function cfgMsg(t, ok) { const e = panel.querySelector('#cfg-msg'); if (e) { e.textContent = t; e.style.color = ok ? 'var(--cg-ok-fg)' : 'var(--cg-faint)'; } }
+    function fetchModels() {
+        const base = (panel.querySelector('#cfg-base').value.trim().replace(/\/+$/, '') || DEFAULTS.baseURL);
+        const key = panel.querySelector('#cfg-key').value.trim();
+        cfgMsg('正在拉取模型列表…');
+        GM_xmlhttpRequest({
+            method: 'GET', url: base + '/models', responseType: 'text', timeout: 20000,
+            headers: { 'Authorization': 'Bearer ' + key },
+            onload: r => {
+                let ids = [];
+                try { const d = JSON.parse(r.responseText); ids = (d.data || d.models || []).map(m => (typeof m === 'string' ? m : m.id)).filter(Boolean); } catch (_) {}
+                if (ids.length) { GM_setValue(STORE.MODELS_CACHE, JSON.stringify(ids)); populateModelSelects(); cfgMsg(`已拉取 ${ids.length} 个模型，可在下拉里选`, true); }
+                else cfgMsg(`未拉到模型（HTTP ${r.status}；确认 Base URL 是否带 /v1、Key 是否正确）`);
+            },
+            onerror: () => cfgMsg('拉取失败（检查 Base URL/Key，或脚本猫是否允许该域名跨域）'),
+            ontimeout: () => cfgMsg('拉取超时'),
+        });
+    }
     function openConfig() {
         panel.querySelector('#cfg-base').value = getBaseURL();
         panel.querySelector('#cfg-key').value = getKey();
-        panel.querySelector('#cfg-model').value = settings().model;
-        panel.querySelector('#cfg-strong').value = settings().strongModel;
+        populateModelSelects();
+        cfgMsg('');
         panel.querySelector('#cgai-config').classList.add('open');
         setTimeout(() => panel.querySelector(getKey() ? '#cfg-base' : '#cfg-key').focus(), 30);
     }
     function closeConfig() { panel.querySelector('#cgai-config').classList.remove('open'); }
+    function pickModel(selId, inpId, fallback) { const s = panel.querySelector(selId), i = panel.querySelector(inpId); return (s.value === OTHER ? i.value.trim() : s.value) || fallback; }
     function saveConfig() {
         GM_setValue(STORE.BASE_URL, panel.querySelector('#cfg-base').value.trim().replace(/\/+$/, '') || DEFAULTS.baseURL);
         GM_setValue(STORE.KEY, panel.querySelector('#cfg-key').value.trim());
-        GM_setValue(STORE.MODEL, panel.querySelector('#cfg-model').value.trim() || DEFAULTS.model);
-        GM_setValue(STORE.STRONG_MODEL, panel.querySelector('#cfg-strong').value.trim());
+        GM_setValue(STORE.MODEL, pickModel('#cfg-model', '#cfg-model-c', DEFAULTS.model));
+        GM_setValue(STORE.STRONG_MODEL, pickModel('#cfg-strong', '#cfg-strong-c', ''));
         updateModelTxt(); closeConfig(); setStatus('配置已保存。', 'ok');
     }
     function ensureConfig() { if (getKey()) return true; openConfig(); setStatus('请先在配置页填写 API Key 再使用。', 'busy'); return false; }
@@ -761,11 +801,13 @@
             <div id="cgai-config">
                 <div class="cfg-head"><div><b>配置</b> <span class="sub">OpenAI 兼容</span></div><span class="cgai-ic" id="cfg-x" title="关闭">${ICON.minus}</span></div>
                 <div class="cfg-body">
-                    <div class="cgai-field"><label>API Base URL</label><input id="cfg-base" type="text" spellcheck="false" placeholder="https://api.deepseek.com"><span class="hint">调用 &lt;BaseURL&gt;/chat/completions；可换任意 OpenAI 兼容服务（DeepSeek 时才发送 thinking 参数）。</span></div>
+                    <div class="cgai-field"><label>API Base URL</label><input id="cfg-base" type="text" spellcheck="false" placeholder="https://api.deepseek.com"><span class="hint">调用 &lt;BaseURL&gt;/chat/completions 与 /models；可换任意 OpenAI 兼容服务（GPT 代理一般要带 /v1，如 https://aiapis.help/v1；DeepSeek 时才发送 thinking 参数）。</span></div>
                     <div class="cgai-field"><label>API Key</label><input id="cfg-key" type="password" spellcheck="false" placeholder="sk-..."></div>
-                    <div class="cgai-field"><label>主模型</label><input id="cfg-model" type="text" list="cgai-models" spellcheck="false" placeholder="deepseek-v4-flash"></div>
-                    <div class="cgai-field"><label>重试强模型（可选，失败时升级用）</label><input id="cfg-strong" type="text" list="cgai-models" spellcheck="false" placeholder="deepseek-v4-pro"></div>
-                    <datalist id="cgai-models"></datalist>
+                    <div class="cgai-field"><label>主模型 <button class="cgai-mini" id="cfg-fetch" type="button">🔄 刷新模型列表</button></label>
+                        <select id="cfg-model"></select><input id="cfg-model-c" type="text" spellcheck="false" placeholder="自定义模型名" style="display:none">
+                        <span class="hint" id="cfg-msg"></span></div>
+                    <div class="cgai-field"><label>重试强模型（可选，失败时升级用）</label>
+                        <select id="cfg-strong"></select><input id="cfg-strong-c" type="text" spellcheck="false" placeholder="自定义模型名（留空=不升级）" style="display:none"></div>
                 </div>
                 <div class="cgai-btns"><button class="cgai-btn cgai-btn-primary" id="cfg-save">保存</button><button class="cgai-btn cgai-btn-ghost" id="cfg-cancel">取消</button></div>
             </div>`;
@@ -785,7 +827,6 @@
         auto.onchange = () => GM_setValue(STORE.AUTO_SUBMIT, auto.checked);
         skip.onchange = () => GM_setValue(STORE.SKIP_PASSED, skip.checked);
         att.onchange = () => GM_setValue(STORE.MAX_ATTEMPTS, Math.min(5, Math.max(1, +att.value || 3)));
-        const dl = panel.querySelector('#cgai-models'); MODEL_SUGGEST.forEach(m => { const o = document.createElement('option'); o.value = m; dl.appendChild(o); });
         updateModelTxt();
         btnSolve.onclick = runSolveCurrent;
         panel.querySelector('#cgai-cfg').onclick = openConfig;
@@ -793,6 +834,9 @@
         panel.querySelector('#cfg-x').onclick = closeConfig;
         panel.querySelector('#cfg-cancel').onclick = closeConfig;
         panel.querySelector('#cfg-save').onclick = saveConfig;
+        panel.querySelector('#cfg-fetch').onclick = fetchModels;
+        panel.querySelector('#cfg-model').onchange = e => syncCustom(e.target, panel.querySelector('#cfg-model-c'));
+        panel.querySelector('#cfg-strong').onchange = e => syncCustom(e.target, panel.querySelector('#cfg-strong-c'));
         panel.querySelector('#cgai-min').onclick = () => { panel.style.display = 'none'; fab.style.display = 'flex'; };
         fab.onclick = () => { panel.style.display = 'flex'; fab.style.display = 'none'; };
         makeDraggable(panel, panel.querySelector('#cgai-head'));

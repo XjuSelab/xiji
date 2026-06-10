@@ -80,6 +80,18 @@ console.log('\n[失败反馈 dynamictest]');
     ok('纯行尾空格差异不漏 + 标注格式', /测试点1/.test(ffb) && /仅空白\/格式/.test(ffb), ffb.slice(0, 80));
 }
 
+console.log('\n[配置页模型下拉]');
+{
+    const { w } = load('pl1.html', 'http://10.109.120.139/x');
+    w.document.getElementById('cgai-cfg').click(); // openConfig
+    const sel = w.document.getElementById('cfg-model');
+    ok('主模型是 select 下拉且有选项', sel && sel.tagName === 'SELECT' && sel.options.length > 1);
+    ok('下拉含默认模型 deepseek-v4-flash', [...sel.options].some(o => o.value === 'deepseek-v4-flash'));
+    ok('下拉含「其他/自定义」项', [...sel.options].some(o => o.value === '__other__'));
+    sel.value = '__other__'; sel.dispatchEvent(new w.Event('change'));
+    ok('选自定义→显示文本框', w.document.getElementById('cfg-model-c').style.display !== 'none');
+}
+
 console.log('\n[模型梯队 / 判分]');
 {
     const { api } = load('pl1.html', 'http://10.109.120.139/x');
